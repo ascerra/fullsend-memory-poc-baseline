@@ -90,9 +90,10 @@ func TestRunReposInstall_ConvergesPreflightGlobSelection(t *testing.T) {
 	}
 }
 
-// A repository listed by the preflights but gone from the live listing is
-// still converged with the others, and nothing is reported for it.
-func TestRunReposInstall_GlobRepoRemovedAfterPreflightsIsNotReported(t *testing.T) {
+// A repository listed by the preflights but gone from the live listing
+// (deleted, archived or transferred in between) is reported and not probed
+// or written, and the others still converge.
+func TestRunReposInstall_GlobRepoRemovedAfterPreflightsIsSkipped(t *testing.T) {
 	manifest := strings.Replace(githubUnmanagedManifestYAML, "acme/api", "acme/*", 1)
 	path := writeTestManifest(t, manifest)
 	fc := newInstallFakeClient("acme/api", "acme/web")
@@ -105,8 +106,9 @@ func TestRunReposInstall_GlobRepoRemovedAfterPreflightsIsNotReported(t *testing.
 	out := captureStdout(t, func() { err = runReposInstall(context.Background(), opts) })
 	require.NoError(t, err, out)
 	assert.NotContains(t, out, "not installed: it appeared after")
-	for _, repo := range []string{"acme/api", "acme/web"} {
-		assert.Contains(t, string(fc.FileContents[overlayPath(repo)]), "fullsend-ai/fullsend", "%s converges", repo)
-		requireTraceKeyWritten(t, fc, repo, out)
-	}
+	assert.Contains(t, out, "[acme/web] not installed: it is no longer listed in its org (deleted, archived or transferred)")
+	assert.Empty(t, fc.FileContents[overlayPath("acme/web")], "acme/web gets no scaffold commit")
+	assert.Empty(t, writtenTraceSeed(fc, "acme/web"), "acme/web gets no trace signing key")
+	assert.Contains(t, string(fc.FileContents[overlayPath("acme/api")]), "fullsend-ai/fullsend", "acme/api converges")
+	requireTraceKeyWritten(t, fc, "acme/api", out)
 }

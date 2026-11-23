@@ -240,6 +240,20 @@ func matchesPattern(pattern, name string) (bool, error) {
 	return filepath.Match(strings.ToLower(pattern), strings.ToLower(name))
 }
 
+// matchesAnyPattern reports whether name matches a pattern in filter. An
+// empty filter matches every name; an invalid pattern matches none.
+func matchesAnyPattern(filter []string, name string) bool {
+	if len(filter) == 0 {
+		return true
+	}
+	for _, pattern := range filter {
+		if ok, err := matchesPattern(pattern, name); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
 func isGlob(s string) bool {
 	return strings.ContainsAny(s, "*?[")
 }

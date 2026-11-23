@@ -2,7 +2,9 @@ package repos
 
 import (
 	"context"
+	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/fullsend-ai/fullsend/internal/forge"
@@ -17,17 +19,18 @@ import (
 // The cache never observes a write it did not make, so it is only correct
 // for a window in which nothing writes to the forge. `repos install` uses
 // one for its read-only configuration preflights (ownership, install
-// defaults, trace signing keys, proposed safety, effective infrastructure).
-// Convergence keeps reading current state through the original clients; it
-// uses the cache only to expand glob entries (ConvergeConfig.GlobListing),
-// since install's writes never change an org listing, so it converges the
-// repositories the preflights evaluated. Successful reads and
-// not-found answers are cached; any other error is returned uncached.
-func NewPreflightReadCache(clients ForgeClientFactory) ForgeClientFactory {
-	return &preflightReadCache{clients: clients, byForge: make(map[string]*cachingReadClient)}
+// defaults, trace signing keys, proposed safety, effective infrastructure)
+// and does not read through it once the writes begin. Convergence keeps
+// reading current state through the original clients, and takes from the
+// cache only a frozen snapshot of its org listings (OrgListings) to expand
+// glob entries. Successful reads and not-found answers are cached; any other
+// error is returned uncached.
+func NewPreflightReadCache(clients ForgeClientFactory) *PreflightReadCache {
+	return &PreflightReadCache{clients: clients, byForge: make(map[string]*cachingReadClient)}
 }
 
-type preflightReadCache struct {
+// PreflightReadCache is the ForgeClientFactory NewPreflightReadCache returns.
+type PreflightReadCache struct {
 	clients ForgeClientFactory
 
 	mu      sync.Mutex
@@ -38,7 +41,7 @@ type preflightReadCache struct {
 // replaced by a caching client shared by every call for the same forge
 // (the wrapped factory caches its clients per forge too). Factory errors
 // are returned as-is and not cached.
-func (c *preflightReadCache) ConfigFor(forgeName string) (ForgeConfig, error) {
+func (c *PreflightReadCache) ConfigFor(forgeName string) (ForgeConfig, error) {
 	fc, err := c.clients.ConfigFor(forgeName)
 	if err != nil {
 		return fc, err
@@ -171,4 +174,88 @@ func (c *cachingReadClient) ListOrgRepos(ctx context.Context, org string, includ
 	c.orgRepos[key] = slices.Clone(repos)
 	c.mu.Unlock()
 	return repos, nil
+}
+
+// OrgListings returns a snapshot of the org repository listings the cache has
+// read so far. `repos install` takes it once its preflights have run and
+// passes it to convergence (ConvergeConfig.GlobListing), so convergence
+// expands glob entries from exactly the listings the preflights evaluated.
+// Later reads through the cache do not change the snapshot.
+func (c *PreflightReadCache) OrgListings() *OrgListings {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	l := &OrgListings{byForge: make(map[string]map[orgReposKey][]forge.Repository, len(c.byForge))}
+	for forgeName, client := range c.byForge {
+		client.mu.Lock()
+		listings := make(map[orgReposKey][]forge.Repository, len(client.orgRepos))
+		for key, repos := range client.orgRepos {
+			listings[key] = slices.Clone(repos)
+		}
+		client.mu.Unlock()
+		l.byForge[forgeName] = listings
+	}
+	return l
+}
+
+// OrgListings is a fixed set of org repository listings per forge, org and
+// visibility, taken by PreflightReadCache.OrgListings. It never lists an org
+// itself: expanding a glob whose org it does not hold is an error rather
+// than a live read, so convergence cannot select a repository the preflights
+// did not evaluate.
+type OrgListings struct {
+	byForge map[string]map[orgReposKey][]forge.Repository
+}
+
+// lists reports whether l holds the listing glob expansion reads for rr's org
+// (private repositories included) and, if it does, whether that listing
+// contains rr.
+func (l *OrgListings) lists(rr ResolvedRepo) (orgListed, repoListed bool) {
+	repos, ok := l.byForge[rr.Forge][orgReposKey{org: rr.Owner, includePrivate: true}]
+	if !ok {
+		return false, false
+	}
+	for _, r := range repos {
+		if strings.EqualFold(r.Name, rr.Repo) {
+			return true, true
+		}
+	}
+	return true, false
+}
+
+// clients returns a factory for expanding glob entries from l: its configs
+// are live's, with clients whose ListOrgRepos answers only from l. Glob
+// expansion reads nothing else.
+func (l *OrgListings) clients(live ForgeClientFactory) ForgeClientFactory {
+	return orgListingsFactory{listings: l, live: live}
+}
+
+type orgListingsFactory struct {
+	listings *OrgListings
+	live     ForgeClientFactory
+}
+
+func (f orgListingsFactory) ConfigFor(forgeName string) (ForgeConfig, error) {
+	fc, err := f.live.ConfigFor(forgeName)
+	if err != nil {
+		return fc, err
+	}
+	fc.Client = &orgListingsClient{Client: fc.Client, forgeName: forgeName, listings: f.listings}
+	return fc, nil
+}
+
+type orgListingsClient struct {
+	forge.Client
+
+	forgeName string
+	listings  *OrgListings
+}
+
+// ListOrgRepos returns a copy of the snapshot's listing, or an error when
+// the snapshot does not hold one.
+func (c *orgListingsClient) ListOrgRepos(_ context.Context, org string, includePrivate bool) ([]forge.Repository, error) {
+	repos, ok := c.listings.byForge[c.forgeName][orgReposKey{org: org, includePrivate: includePrivate}]
+	if !ok {
+		return nil, fmt.Errorf("org %q on %s was not listed by this run's preflights", org, c.forgeName)
+	}
+	return slices.Clone(repos), nil
 }

@@ -273,3 +273,20 @@ func TestMatchManifestRepos_BadPattern(t *testing.T) {
 		t.Error("expected error for malformed glob pattern")
 	}
 }
+
+func TestMatchesAnyPattern(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		filter []string
+		want   bool
+	}{
+		{"an empty filter matches everything", nil, true},
+		{"a matching pattern", []string{"other/x", "acme/*"}, true},
+		{"no matching pattern", []string{"other/*"}, false},
+		{"an invalid pattern matches nothing", []string{"acme/["}, false},
+	} {
+		if got := matchesAnyPattern(tc.filter, "acme/api"); got != tc.want {
+			t.Errorf("%s: matchesAnyPattern(%q, acme/api) = %v, want %v", tc.name, tc.filter, got, tc.want)
+		}
+	}
+}
