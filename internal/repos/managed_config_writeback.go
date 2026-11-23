@@ -407,7 +407,7 @@ func EnsureManagedConfigDefaults(ctx context.Context, cfg ManagedConfigWriteback
 		entry := findExplicitEntry(m, name)
 		if entry == nil {
 			needsNewEntry[name] = true
-			carved, glob, err := carveOutForForge(m, name, p.rr.Forge, "")
+			carved, glob, err := carveOutForForge(m, name, p.rr.Forge, p.rr.glob)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", name, err)
 			}
@@ -551,7 +551,8 @@ func findExplicitEntry(m *Manifest, name string) *RepoEntry {
 }
 
 // newEntrySuggestion builds the complete explicit entry a glob-covered
-// repository needs: the covering glob's settings copied under the concrete
+// repository needs: the settings of the glob that selected it (or, when no
+// glob was recorded, of the first covering glob) copied under the concrete
 // name (explicit entries replace glob resolution, so config alone would drop
 // fields such as inference.auth and runtime) with the pending config
 // applied. The manifest is not modified.
@@ -562,7 +563,7 @@ func newEntrySuggestion(m *Manifest, p pendingWriteback) RepoEntry {
 		entry = *existing
 	} else if platform := m.PlatformFor(p.rr.Forge); platform != nil {
 		scratch := &PlatformConfig{Repos: slices.Clone(platform.Repos)}
-		if carved, _, _ := carveOutGlobEntry([]*PlatformConfig{scratch}, name, ""); carved != nil {
+		if carved, _, _ := carveOutGlobEntry([]*PlatformConfig{scratch}, name, p.rr.glob); carved != nil {
 			entry = *carved
 		}
 	}
