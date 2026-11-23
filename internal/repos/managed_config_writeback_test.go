@@ -158,6 +158,66 @@ func TestEnsureManagedConfigDefaults_GlobCoveredGetsScopedEntry(t *testing.T) {
 	assert.True(t, m.GitHub.Repos[1].Config.IsSet())
 }
 
+// globSelectionCases covers which glob entry a glob-covered repository's
+// new entry is copied from when two globs overlap. acme/infra-* is listed
+// first, but selection matches a glob case-sensitively, so it selects
+// acme/Infra-Tools only through acme/*.
+var globSelectionCases = []struct {
+	name string
+	repo string
+	// fork leaves repo out of the org listing, so it is selected by name.
+	fork bool
+	// copied is the glob entry repo's entry is copied from, and ref its
+	// fullsend_ref.
+	copied, ref string
+}{
+	{name: "glob that selected it", repo: "acme/Infra-Tools", copied: "acme/*", ref: "v1.2.3"},
+	{name: "same case", repo: "acme/infra-tools", copied: "acme/infra-*", ref: "v9.9.9"},
+	// No glob is recorded for a name-selected fork, so the first glob
+	// that covers it ignoring case is copied.
+	{name: "fork selected by name", repo: "acme/Infra-Tools", fork: true, copied: "acme/infra-*", ref: "v9.9.9"},
+}
+
+func overlappingGlobManifest(forgeName string) *Manifest {
+	m := &Manifest{Version: 1, Defaults: testInferenceDefaults(), GitHub: &PlatformConfig{
+		Repos: []RepoEntry{{Name: "acme/infra-*", FullsendRef: "v9.9.9"}, {Name: "acme/*", FullsendRef: "v1.2.3"}},
+	}}
+	if forgeName == ForgeGitLab {
+		m.GitLab, m.GitHub = m.GitHub, nil
+	}
+	return m
+}
+
+// The new entry is copied from the glob entry that selected the repository,
+// not from the first glob that covers it ignoring case.
+func TestEnsureManagedConfigDefaults_GlobCoveredCopiesSelectingGlob(t *testing.T) {
+	for _, forgeName := range []string{ForgeGitHub, ForgeGitLab} {
+		for _, tc := range globSelectionCases {
+			t.Run(forgeName+"/"+tc.name, func(t *testing.T) {
+				m := overlappingGlobManifest(forgeName)
+				fc := newFakeClientForBatch(tc.repo, "acme/web")
+				fc.Repos[0].Fork = tc.fork
+
+				var msgs []string
+				names, err := EnsureManagedConfigDefaults(context.Background(), ManagedConfigWritebackConfig{
+					Manifest: m, RepoFilter: []string{tc.repo},
+				}, newTestClientFactory(fc), func(repo, _, msg string) { msgs = append(msgs, repo+": "+msg) })
+				require.NoError(t, err)
+				assert.Equal(t, []string{tc.repo}, names)
+				require.Len(t, msgs, 1)
+				assert.Contains(t, msgs[0], "in the new manifest entry "+tc.repo+", copied from the glob entry "+tc.copied)
+
+				repos := m.PlatformFor(forgeName).Repos
+				require.Len(t, repos, 3, "one entry is carved out")
+				carved := repos[2]
+				assert.Equal(t, tc.repo, carved.Name)
+				assert.Equal(t, tc.ref, carved.FullsendRef, "the carved entry keeps the settings of the glob it names")
+				assert.True(t, carved.Config.IsSet())
+			})
+		}
+	}
+}
+
 func TestEnsureManagedConfigDefaults_GlobFilterOnlyTouchesFirstInstalls(t *testing.T) {
 	m := &Manifest{Version: 1, Defaults: testInferenceDefaults(), GitHub: &PlatformConfig{
 		Repos: []RepoEntry{{Name: "acme/*"}},
@@ -307,6 +367,29 @@ func TestEnsureManagedConfigDefaults_ReadOnlyGlobCoveredSuggestsFullEntry(t *tes
 	}
 	require.Len(t, m.GitHub.Repos, 1, "a read-only manifest is not edited in memory either")
 	assert.False(t, m.GitHub.Repos[0].Config.IsSet())
+}
+
+// The entry suggested for a read-only manifest is copied from the glob entry
+// that selected the repository, as a writable manifest's carve-out is.
+func TestEnsureManagedConfigDefaults_ReadOnlySuggestionCopiesSelectingGlob(t *testing.T) {
+	for _, forgeName := range []string{ForgeGitHub, ForgeGitLab} {
+		for _, tc := range globSelectionCases {
+			t.Run(forgeName+"/"+tc.name, func(t *testing.T) {
+				m := overlappingGlobManifest(forgeName)
+				fc := newFakeClientForBatch(tc.repo, "acme/web")
+				fc.Repos[0].Fork = tc.fork
+
+				_, err := EnsureManagedConfigDefaults(context.Background(), ManagedConfigWritebackConfig{
+					Manifest: m, ManifestPath: "https://example.com/repos.yaml", RepoFilter: []string{tc.repo},
+				}, newTestClientFactory(fc), nil)
+				require.Error(t, err)
+				msg := err.Error()
+				assert.Contains(t, msg, "- name: "+tc.repo)
+				assert.Contains(t, msg, "fullsend_ref: "+tc.ref, "the suggested entry carries the settings of the glob %s", tc.copied)
+				require.Len(t, m.PlatformFor(forgeName).Repos, 2, "a read-only manifest is not edited in memory either")
+			})
+		}
+	}
 }
 
 func TestEnsureManagedConfigDefaults_WriteFailureSuggestsEdit(t *testing.T) {
