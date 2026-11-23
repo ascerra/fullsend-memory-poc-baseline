@@ -948,7 +948,7 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 		}
 		repos = kept
 	}
-	excludedUsesOpenAI, excludedUsesVertex, excludedUsesJira := skippedCredentialConsumers(ctx, manifest, store, skipped)
+	skippedUsesOpenAI, skippedUsesVertex, skippedUsesJira := skippedCredentialConsumers(ctx, manifest, store, skipped)
 	if len(repos) == 0 {
 		return &ConvergeBatchResult{}, nil
 	}
@@ -1207,7 +1207,7 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 	// input group only needs one consumer. Excluded repos, and repos
 	// reconcileGlobSelection dropped, still count as consumers (they remain
 	// selected) but receive no write.
-	usesOpenAI, usesVertex := excludedUsesOpenAI, excludedUsesVertex
+	usesOpenAI, usesVertex := skippedUsesOpenAI, skippedUsesVertex
 	for _, d := range discoveries {
 		switch d.resolved.InferenceAuth {
 		case InferenceAuthOpenAIAPIKey:
@@ -1229,7 +1229,7 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 	}
 	// A repository whose discovery failed may still enable Jira polling;
 	// it is reported on its own rather than failing the whole run.
-	usesJira := excludedUsesJira
+	usesJira := skippedUsesJira
 	for _, d := range discoveries {
 		if d.jira.enabled || d.configErr != nil || d.err != nil {
 			usesJira = true

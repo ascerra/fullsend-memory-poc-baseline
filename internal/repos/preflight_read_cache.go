@@ -156,10 +156,13 @@ func (c *cachingReadClient) RepoSecretExists(ctx context.Context, owner, repo, n
 }
 
 // ListOrgRepos caches the listing per org and visibility, so each preflight
-// expanding the same glob reuses one listing. Each caller receives its own
-// copy of the slice.
+// expanding the same glob reuses one listing. The org is keyed as
+// OrgListings keys it (orgListingKey), so globs whose orgs differ only in
+// case, such as Acme/a* and acme/b*, share one listing and the snapshot
+// never has to choose between two read at different moments. Each caller
+// receives its own copy of the slice.
 func (c *cachingReadClient) ListOrgRepos(ctx context.Context, org string, includePrivate bool) ([]forge.Repository, error) {
-	key := orgReposKey{org: org, includePrivate: includePrivate}
+	key := orgListingKey(org, includePrivate)
 	c.mu.Lock()
 	r, ok := c.orgRepos[key]
 	c.mu.Unlock()
@@ -189,7 +192,7 @@ func (c *PreflightReadCache) OrgListings() *OrgListings {
 		client.mu.Lock()
 		listings := make(map[orgReposKey][]forge.Repository, len(client.orgRepos))
 		for key, repos := range client.orgRepos {
-			listings[orgListingKey(key.org, key.includePrivate)] = slices.Clone(repos)
+			listings[key] = slices.Clone(repos)
 		}
 		client.mu.Unlock()
 		l.byForge[forgeName] = listings

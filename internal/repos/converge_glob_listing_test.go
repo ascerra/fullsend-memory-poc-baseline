@@ -146,6 +146,58 @@ func TestReconcileGlobSelection_MixedCaseOwner(t *testing.T) {
 	}
 }
 
+// createAfterFirstListClient counts the org listings that reach the wrapped
+// fake and, right after the first one, adds the created repository to the
+// org, so a second listing of the org differs from the first.
+type createAfterFirstListClient struct {
+	*forge.FakeClient
+
+	created forge.Repository
+	lists   []string
+}
+
+func (c *createAfterFirstListClient) ListOrgRepos(ctx context.Context, org string, includePrivate bool) ([]forge.Repository, error) {
+	repos, err := c.FakeClient.ListOrgRepos(ctx, org, includePrivate)
+	c.lists = append(c.lists, org)
+	if len(c.lists) == 1 {
+		c.Repos = append(c.Repos, c.created)
+	}
+	return repos, err
+}
+
+// Glob entries whose orgs differ only in case read one listing through the
+// preflight cache, so the snapshot never has to choose between two listings
+// read at different moments. A repository created after that one listing is
+// left out of the selection and reported, whichever glob it matches.
+func TestReconcileGlobSelection_CaseVariantGlobOrgs(t *testing.T) {
+	ctx := context.Background()
+	m := globListingManifest(t)
+	m.GitHub.Repos = []RepoEntry{{Name: "Acme/a*"}, {Name: "acme/b*"}}
+	fc := &createAfterFirstListClient{
+		FakeClient: acmeListing("api"),
+		created:    forge.Repository{Name: "billing", FullName: "acme/billing"},
+	}
+	cache := NewPreflightReadCache(newTestClientFactory(fc))
+	// Two preflights expand the same manifest through the shared cache.
+	for range 2 {
+		_, err := m.ExpandGlobsFor(ctx, cache, nil)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, []string{"Acme"}, fc.lists, "the preflights list the org once, whatever its case")
+	preflight := cache.OrgListings()
+
+	selected, err := m.ExpandGlobsFor(ctx, preflight.clients(newTestClientFactory(fc)), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Acme/api"}, repoNames(selected))
+
+	progress := &progressLog{}
+	kept, dropped, err := reconcileGlobSelection(ctx, m, newTestClientFactory(fc), preflight, nil, selected, progress.fn)
+	require.NoError(t, err)
+	assert.Equal(t, selected, kept)
+	assert.Empty(t, dropped)
+	assert.Equal(t, []string{"acme/billing warning not installed: it appeared after this run's preflights evaluated the repository selection; run repos install again to install it"}, progress.all())
+}
+
 // A live listing that fails stops reconciliation with the error, so
 // convergence cannot probe or write a repository it can no longer tell was
 // removed since the preflights.
@@ -199,7 +251,10 @@ func TestConverge_GlobListingDroppedRepoCountsAsCredentialConsumer(t *testing.T)
 		healthyAuth string
 		dropped     RepoEntry
 		set         func(*ConvergeConfig)
-		wantErr     string
+		// prepare gives the healthy repository the credentials its own
+		// inference.auth needs, so only the dropped one consumes the flag.
+		prepare func(live *forge.FakeClient)
+		wantErr string
 	}{
 		"openai-api-key": {
 			healthyAuth: InferenceAuthVertexWIF,
@@ -210,6 +265,9 @@ func TestConverge_GlobListingDroppedRepoCountsAsCredentialConsumer(t *testing.T)
 			healthyAuth: InferenceAuthOpenAIAPIKey,
 			dropped:     RepoEntry{Name: "acme/docs", Inference: InferenceSettings{Auth: InferenceAuthVertexWIF}},
 			set:         func(c *ConvergeConfig) { c.InferenceProject = "test-inference" },
+			prepare: func(live *forge.FakeClient) {
+				live.Secrets["acme/api/FULLSEND_OPENAI_API_KEY"] = true
+			},
 		},
 		"jira": {
 			healthyAuth: InferenceAuthVertexWIF,
@@ -234,6 +292,9 @@ func TestConverge_GlobListingDroppedRepoCountsAsCredentialConsumer(t *testing.T)
 			preflight := preflightOrgListings(t, m, newFakeClientForBatch("acme/api", "acme/docs"))
 			live := newFakeClientForBatch("acme/api")
 			markFullyInstalled(live, "acme", "api")
+			if tc.prepare != nil {
+				tc.prepare(live)
+			}
 			cfg := withoutInferenceInputs(convergeCfgWithDefaults(m))
 			cfg.DryRun = true
 			cfg.GlobListing = preflight
@@ -249,6 +310,7 @@ func TestConverge_GlobListingDroppedRepoCountsAsCredentialConsumer(t *testing.T)
 			require.NoError(t, err)
 			require.Len(t, result.Results, 1)
 			assert.Equal(t, "api", result.Results[0].Repo)
+			assert.NoError(t, result.Results[0].Error)
 			assert.Contains(t, progress.all(), "acme/docs warning not installed: it is no longer listed in its org (deleted, archived or transferred) since this run's preflights evaluated the repository selection")
 			assertNoForgeWrites(t, live)
 		})

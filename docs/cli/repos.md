@@ -266,8 +266,9 @@ flags, as an excluded repository does, so a flag only it uses (for example
 `--openai-api-key`) does not fail the run for the other repositories. Org
 names are compared case-insensitively, so an explicit `Acme/docs` entry is
 checked against the listing an `acme/*` glob read. If convergence cannot list
-a glob entry's org again for this comparison, install fails before any
-repository is checked or written; run it again once the org can be listed.
+a glob entry's org again for this comparison, install fails before
+convergence checks or writes any repository; run it again once the org can be
+listed.
 
 Credentials are required only for the forges of the selected repos: a GitLab-only selection does not need `GH_TOKEN`, and a GitHub-only selection does not need `GITLAB_TOKEN`. An unfiltered run still requires credentials for every forge present in the manifest.
 
