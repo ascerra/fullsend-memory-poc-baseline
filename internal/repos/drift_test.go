@@ -387,6 +387,44 @@ func TestCheckOrphanVars_GitLabWebhookVarsManagedButGenuineOrphanReported(t *tes
 	}
 }
 
+// The Jira polling credentials are written by convergeJiraPoll and kept
+// while polling is disabled, so status does not report them as orphans
+// whatever the tracker.jira config, while an unknown FULLSEND_ variable
+// beside them still is.
+func TestCheckOrphanVars_JiraCredentialsManaged(t *testing.T) {
+	jiraNames := []string{forge.SecretJiraToken, forge.SecretJiraEmail, forge.SecretJiraClientID, forge.SecretJiraClientSecret}
+	for _, name := range jiraNames {
+		if !slices.Contains(jiraManagedSecrets, name) {
+			t.Errorf("jiraManagedSecrets must include %s", name)
+		}
+	}
+	cases := []struct{ forgeName, mintURL string }{
+		{ForgeGitLab, ""},
+		{ForgeGitHub, "https://mint.example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.forgeName, func(t *testing.T) {
+			fc := forge.NewFakeClient()
+			if tc.mintURL != "" {
+				fc.VariableValues["owner/repo/"+forge.VarMintURL] = tc.mintURL
+			}
+			for _, name := range jiraManagedSecrets {
+				fc.VariableValues["owner/repo/"+name] = "x"
+			}
+			fc.VariableValues["owner/repo/FULLSEND_SOMETHING_ELSE"] = "x"
+
+			orphans, err := CheckOrphanVars(context.Background(), fc, "owner", "repo",
+				InstallConfig{Forge: tc.forgeName, MintURL: tc.mintURL}, tc.mintURL)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(orphans) != 1 || orphans[0].Name != "FULLSEND_SOMETHING_ELSE" {
+				t.Errorf("orphans = %v, want only FULLSEND_SOMETHING_ELSE", orphans)
+			}
+		})
+	}
+}
+
 // Install writes FULLSEND_TRACE_SIGNING_KEY_ID on GitHub only (ADR 0154), so
 // status counts it as managed there, while an unknown FULLSEND_ variable
 // beside it is still an orphan. On GitLab install writes no such variable,

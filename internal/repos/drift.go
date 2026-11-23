@@ -227,6 +227,13 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 	for _, s := range managedInferenceSecrets() {
 		managedNames[s] = true
 	}
+	// The Jira polling credentials are written by convergeJiraPoll, outside
+	// managedVarsForForge and requiredSecretsForForge. Install keeps them
+	// while polling is disabled, so they are managed regardless of the
+	// tracker.jira config.
+	for _, s := range jiraManagedSecrets {
+		managedNames[s] = true
+	}
 	// Install records the trace signing key's key ID in this variable on
 	// GitHub (ADR 0154). It is managed but, like FULLSEND_DISPATCH_SECRET,
 	// not required.
