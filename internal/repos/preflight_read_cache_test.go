@@ -432,3 +432,34 @@ func TestInstallPreflights_SharedCacheReportsAdoptionPerRepo(t *testing.T) {
 	assert.Equal(t, original, fc.FileContents["acme/api/"+preset.OverlayPath])
 	assertNoForgeWrites(t, fc)
 }
+
+// OrgListings holds the listings the cache read before it was taken, never
+// lists anything itself, and is not changed by later reads through the cache.
+func TestPreflightReadCache_OrgListingsIsFrozen(t *testing.T) {
+	ctx := context.Background()
+	fc := forge.NewFakeClient()
+	fc.OrgRepos = map[string][]forge.Repository{
+		"acme":  {{Name: "api", FullName: "acme/api"}},
+		"other": {{Name: "x", FullName: "other/x"}},
+	}
+	cache := NewPreflightReadCache(newTestClientFactory(fc))
+	cfg, err := cache.ConfigFor(ForgeGitHub)
+	require.NoError(t, err)
+	_, err = cfg.Client.ListOrgRepos(ctx, "acme", true)
+	require.NoError(t, err)
+
+	listings := cache.OrgListings()
+	_, err = cfg.Client.ListOrgRepos(ctx, "other", true)
+	require.NoError(t, err, "the cache itself still lists live")
+	fc.OrgRepos["acme"] = append(fc.OrgRepos["acme"], forge.Repository{Name: "web", FullName: "acme/web"})
+
+	snap, err := listings.clients(newTestClientFactory(fc)).ConfigFor(ForgeGitHub)
+	require.NoError(t, err)
+	repos, err := snap.Client.ListOrgRepos(ctx, "acme", true)
+	require.NoError(t, err)
+	assert.Equal(t, []forge.Repository{{Name: "api", FullName: "acme/api"}}, repos)
+	_, err = snap.Client.ListOrgRepos(ctx, "acme", false)
+	assert.ErrorContains(t, err, "was not listed by this run's preflights", "visibility is part of the key")
+	_, err = snap.Client.ListOrgRepos(ctx, "other", true)
+	assert.ErrorContains(t, err, `org "other" on github was not listed by this run's preflights`, "a later cache read is not in the snapshot")
+}

@@ -32,6 +32,20 @@ type ConvergeConfig struct {
 	ExcludeRepos   []string
 	MaxConcurrency int
 
+	// GlobListing, when non-nil, holds the org listings the manifest's glob
+	// entries are expanded from in place of live listings, so convergence
+	// selects the repositories the caller's preflights evaluated. repos
+	// install passes the snapshot of its preflight read cache
+	// (PreflightReadCache.OrgListings). A glob org it does not hold fails
+	// convergence before any probe or write. Convergence lists the glob
+	// orgs live once more to compare: a repository only the live listing
+	// shows, such as one created after the preflights, is left out of this
+	// run and reported so the operator can run install again; a selected
+	// repository GlobListing lists but the live listing no longer does,
+	// such as one deleted, archived or transferred since, is dropped and
+	// reported. Every other read and every write goes through the clients.
+	GlobListing *OrgListings
+
 	// UpstreamRef is the git ref (SHA) used to pin scaffold workflow refs.
 	UpstreamRef string
 	// UpstreamTag is the version tag corresponding to UpstreamRef.
@@ -767,6 +781,51 @@ func pristineInstallation(components []ComponentStatus) bool {
 	return true
 }
 
+// reconcileGlobSelection lists the manifest's glob orgs again through
+// clients and compares that live listing with selected, which was expanded
+// from the preflights' listings. It reports, through progress, each
+// repository the glob entries now match that selected does not contain: it
+// appeared after the selection was made, so this run leaves it out without
+// checking or installing it, and running install again selects it. It
+// drops from selected, and reports, each repository the preflights' listing
+// of its org showed but the live listing of that org no longer does: it was
+// deleted, archived or transferred since, so it is not probed or written.
+// The preflights may have given such a repository its own manifest entry,
+// so this does not depend on whether it is still glob-selected; one neither
+// listing showed, such as an explicit entry for a fork, is kept. If the live
+// listing fails, a warning is reported and selected is returned unchanged.
+func reconcileGlobSelection(ctx context.Context, m *Manifest, clients ForgeClientFactory,
+	preflight *OrgListings, filter []string, selected []ResolvedRepo, progress ProgressFunc) []ResolvedRepo {
+	liveClients := NewPreflightReadCache(clients)
+	live, err := m.ExpandGlobsFor(ctx, liveClients, filter)
+	if err != nil {
+		progress("", "warning", fmt.Sprintf("Could not list glob entries' orgs again to compare with this run's repository selection: %v", err))
+		return selected
+	}
+	liveListings := liveClients.OrgListings()
+	known := make(map[string]bool, len(selected))
+	kept := make([]ResolvedRepo, 0, len(selected))
+	for _, rr := range selected {
+		name := rr.Owner + "/" + rr.Repo
+		known[strings.ToLower(name)] = true
+		_, wasListed := preflight.lists(rr)
+		orgListed, stillListed := liveListings.lists(rr)
+		if wasListed && orgListed && !stillListed {
+			progress(name, "warning", "not installed: it is no longer listed in its org (deleted, archived or transferred) since this run's preflights evaluated the repository selection")
+			continue
+		}
+		kept = append(kept, rr)
+	}
+	for _, rr := range live {
+		name := rr.Owner + "/" + rr.Repo
+		if known[strings.ToLower(name)] || !matchesAnyPattern(filter, name) {
+			continue
+		}
+		progress(name, "warning", "not installed: it appeared after this run's preflights evaluated the repository selection; run repos install again to install it")
+	}
+	return kept
+}
+
 // Converge processes every repo in the manifest through a single
 // convergence pipeline: probe → diff → apply. For each repo it
 // determines what components exist and what actions are needed, then
@@ -803,7 +862,11 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 		return nil, fmt.Errorf("invalid manifest: %w", err)
 	}
 
-	repos, err := manifest.ExpandGlobsFor(ctx, clients, cfg.RepoFilter)
+	expandClients := clients
+	if cfg.GlobListing != nil {
+		expandClients = cfg.GlobListing.clients(clients)
+	}
+	repos, err := manifest.ExpandGlobsFor(ctx, expandClients, cfg.RepoFilter)
 	if err != nil {
 		return nil, fmt.Errorf("expanding globs: %w", err)
 	}
@@ -815,6 +878,9 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 		if err != nil {
 			return nil, err
 		}
+	}
+	if cfg.GlobListing != nil {
+		repos = reconcileGlobSelection(ctx, manifest, clients, cfg.GlobListing, cfg.RepoFilter, repos, progress)
 	}
 	store := newPresetCache()
 	excludedUsesOpenAI, excludedUsesVertex, excludedUsesJira := false, false, false

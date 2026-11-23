@@ -773,8 +773,11 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 	// The configuration preflights below only read the forge, and the
 	// manifest is written only after all of them, so they share one read
 	// cache: equivalent layer, component and glob reads are made once
-	// (#8501). It is discarded before the manifest write; convergence
-	// reads current state through clients.
+	// (#8501). Convergence reads current state through clients, except
+	// that it expands glob entries from a frozen snapshot of this cache's
+	// org listings, so it selects the repositories these preflights
+	// evaluated: one created in between is left out and reported instead
+	// of installed unchecked.
 	preflightClients := repos.NewPreflightReadCache(clients)
 
 	// Preflight the existing configuration layers of manifest-tracked repos
@@ -912,6 +915,9 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 	if err := repos.PreflightEffectiveInfrastructure(ctx, manifest, preflightClients, opts.repoFilter, skipped, opts.inferenceProject, opts.inferenceWIFProvider); err != nil {
 		return fmt.Errorf("effective infrastructure preflight: %w", err)
 	}
+	// The preflights are done: freeze the org listings they evaluated so
+	// convergence expands glob entries from exactly those.
+	preflightGlobListings := preflightClients.OrgListings()
 	// Whether --fullsend-binary and --fullsend-source apply, and which forges
 	// need a sign-off identity, come from the manifest settings. Both are
 	// resolved here (including dry runs), from the edited manifest, since a
@@ -1049,6 +1055,7 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		DryRun:                  opts.dryRun,
 		RepoFilter:              opts.repoFilter,
 		ExcludeRepos:            append(containFailedKeys(containFailedRepos), skipped...),
+		GlobListing:             preflightGlobListings,
 		MaxConcurrency:          opts.concurrency,
 		UpstreamRef:             upstreamRef,
 		UpstreamTag:             upstreamTag,

@@ -253,6 +253,16 @@ first-install `tracker` default or, on GitHub, the `trace_context` block to
 `repos.yaml`. Edits to the glob entry do not apply to a repository that has
 its own entry. To give it different settings, declare an explicit entry.
 
+Install lists each glob entry's org once for its preflights (adoption, trace
+signing keys, the configuration safety check and effective infrastructure),
+and convergence installs the repositories that listing returned. A repository
+created in the org after the preflights is left out of the run: install
+reports it as `not installed` with a note to run install again, and the next
+install checks and installs it. A repository the preflights listed that the
+org no longer lists by convergence (deleted, archived or transferred in
+between) is also reported as `not installed`, and install neither checks nor
+writes to it.
+
 Credentials are required only for the forges of the selected repos: a GitLab-only selection does not need `GH_TOKEN`, and a GitHub-only selection does not need `GITLAB_TOKEN`. An unfiltered run still requires credentials for every forge present in the manifest.
 
 Install writes to `repos.yaml` itself in only four cases: the first-install
