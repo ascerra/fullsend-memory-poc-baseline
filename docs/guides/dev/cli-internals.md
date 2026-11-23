@@ -848,7 +848,7 @@ fullsend-repo/                      (embedded template)
 
 Runtime skips upstream fetch when `.defaults/action.yml` is present (vendored); layered installs sparse-checkout `fullsend-ai/fullsend@main` into `.defaults/`.
 
-This repository is itself a per-repo install: its `.github/workflows/fullsend.yaml` and `.github/workflows/prioritize.yml` must be byte-for-byte what `CollectPerRepoInstallFiles` renders from the templates with the default upstream ref and runner. `TestLivePerRepoScaffoldFilesMatchInstallRender` in `internal/scaffold` enforces this, so a template change is paired with a re-render of the live file in the same PR.
+This repository is itself a per-repo install: its `.github/workflows/fullsend.yaml` and `.github/workflows/prioritize.yml` must be byte-for-byte what `CollectPerRepoInstallFiles` renders from the templates with the default runner and the upstream ref and version tag pinned in the live shim's `reusable-dispatch.yml` `uses:` line (for example `@<sha>  # v0.57.1`). `TestLivePerRepoScaffoldFilesMatchInstallRender` in `internal/scaffold` enforces this. It compares each file in its own subtest, pin format included, so a template change is paired with a re-render of the live file in the same PR.
 
 ### File Mode Tracking
 
