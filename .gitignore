@@ -1,0 +1,31 @@
+.env.local
+node_modules/
+.vite/
+.dev.vars
+.wrangler
+.worktrees/
+.fullsend-cache/
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+_site/
+bin/
+.playwright/
+.playwright-mcp/
+.claude/settings.local.json
+.vscode/
+*.env
+.env.*
+!.env.example
+.transcripts/
+docs/plans/
+docs/superpowers/
+docs/.vitepress/cache/
+docs/.vitepress/.temp/
+docs/.vitepress/dist/
+coverage.out
+# make wasm-build output (also built by make mint-cf-worker-test).
+cmd/mint-wasm/mint.wasm
+# QualityFlow working directory; nothing under it belongs in a commit.
+outputs/

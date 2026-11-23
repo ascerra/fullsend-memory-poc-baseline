@@ -1,0 +1,373 @@
+package runtime
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestParseTranscriptFile_ErrorResult(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"assistant","content":[{"type":"text","text":"Working on it..."}]}
+{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Agent reached maximum number of turns","session_id":"abc123"}
+`
+	path := filepath.Join(dir, "test-transcript.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, ok := parseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected IsError to be true")
+	}
+	if summary.Subtype != "error_max_turns" {
+		t.Errorf("expected subtype 'error_max_turns', got %q", summary.Subtype)
+	}
+	if summary.ErrorMessage != "Agent reached maximum number of turns" {
+		t.Errorf("unexpected error message: %q", summary.ErrorMessage)
+	}
+}
+
+func TestParseTranscriptFile_SuccessResult(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"result","subtype":"success","is_error":false,"result":"Task completed","session_id":"abc123"}
+`
+	path := filepath.Join(dir, "test-transcript.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, ok := parseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if summary.IsError {
+		t.Error("expected IsError to be false for success result")
+	}
+}
+
+func TestParseTranscriptFile_NoResult(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"assistant","content":[{"type":"text","text":"Working..."}]}
+`
+	path := filepath.Join(dir, "test-transcript.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok := parseTranscriptFile(path)
+	if ok {
+		t.Error("expected no result event")
+	}
+}
+
+func TestParseTranscriptFile_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.jsonl")
+	if err := os.WriteFile(path, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok := parseTranscriptFile(path)
+	if ok {
+		t.Error("expected no result from empty file")
+	}
+}
+
+func TestParseTranscriptFile_MissingFile(t *testing.T) {
+	_, ok := parseTranscriptFile("/nonexistent/path.jsonl")
+	if ok {
+		t.Error("expected failure for missing file")
+	}
+}
+
+func TestParseTranscriptFile_LastResultWins(t *testing.T) {
+	dir := t.TempDir()
+	// Two result events — the last one should win.
+	content := `{"type":"result","subtype":"success","is_error":false,"result":"first attempt ok"}
+{"type":"result","subtype":"error_max_turns","is_error":true,"result":"second attempt failed"}
+`
+	path := filepath.Join(dir, "multi-result.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, ok := parseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected last result (error) to win")
+	}
+	if summary.ErrorMessage != "second attempt failed" {
+		t.Errorf("unexpected error message: %q", summary.ErrorMessage)
+	}
+}
+
+func TestParseTranscriptFile_TypeWithSpace(t *testing.T) {
+	dir := t.TempDir()
+	// Some JSON encoders add a space after the colon.
+	content := `{"type": "result", "subtype": "error_max_turns", "is_error": true, "result": "failed with space"}
+`
+	path := filepath.Join(dir, "spaced.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, ok := parseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected IsError to be true")
+	}
+	if summary.ErrorMessage != "failed with space" {
+		t.Errorf("unexpected error message: %q", summary.ErrorMessage)
+	}
+}
+
+func TestExtractTranscriptErrors_MultipleFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// File 1: error result.
+	err1 := `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"agent timed out"}`
+	if err := os.WriteFile(filepath.Join(dir, "agent1.jsonl"), []byte(err1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// File 2: success result (should not appear in summaries).
+	ok2 := `{"type":"result","subtype":"success","is_error":false,"result":"all good"}`
+	if err := os.WriteFile(filepath.Join(dir, "agent2.jsonl"), []byte(ok2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// File 3: not a JSONL file (should be skipped).
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("not jsonl"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summaries := parseTranscriptErrors(dir)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 error summary, got %d", len(summaries))
+	}
+	if summaries[0].Source != "agent1.jsonl" {
+		t.Errorf("unexpected source: %q", summaries[0].Source)
+	}
+	if summaries[0].ErrorMessage != "agent timed out" {
+		t.Errorf("unexpected error message: %q", summaries[0].ErrorMessage)
+	}
+}
+
+func TestExtractTranscriptErrors_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	summaries := parseTranscriptErrors(dir)
+	if len(summaries) != 0 {
+		t.Errorf("expected no summaries for empty dir, got %d", len(summaries))
+	}
+}
+
+func TestExtractTranscriptErrors_MissingDir(t *testing.T) {
+	summaries := parseTranscriptErrors("/nonexistent/dir")
+	if summaries != nil {
+		t.Errorf("expected nil for missing dir, got %v", summaries)
+	}
+}
+
+func TestTruncateError(t *testing.T) {
+	short := "short error"
+	if got := truncateError(short); got != short {
+		t.Errorf("short message should not be truncated: %q", got)
+	}
+
+	long := strings.Repeat("x", maxTranscriptErrorLength+100)
+	got := truncateError(long)
+	if len(got) > maxTranscriptErrorLength+20 {
+		t.Errorf("truncated message too long: %d", len(got))
+	}
+	if !strings.HasSuffix(got, "… (truncated)") {
+		t.Errorf("truncated message should end with ellipsis indicator: %q", got)
+	}
+}
+
+func TestEmitTranscriptErrors(t *testing.T) {
+	summaries := []TranscriptError{
+		{
+			Source:       "code-transcript.jsonl",
+			IsError:      true,
+			ErrorMessage: "Agent reached maximum turns",
+			Subtype:      "error_max_turns",
+		},
+	}
+
+	var buf bytes.Buffer
+	emitTranscriptErrors(&buf, summaries)
+
+	output := buf.String()
+	if !strings.Contains(output, "::error title=Agent Error (code-transcript.jsonl)::") {
+		t.Errorf("expected ::error:: annotation, got: %q", output)
+	}
+	if !strings.Contains(output, "Agent reached maximum turns") {
+		t.Errorf("expected error message in output, got: %q", output)
+	}
+}
+
+func TestEmitTranscriptErrors_EmptyMessage(t *testing.T) {
+	summaries := []TranscriptError{
+		{
+			Source:  "test.jsonl",
+			IsError: true,
+			Subtype: "error_unknown",
+		},
+	}
+
+	var buf bytes.Buffer
+	emitTranscriptErrors(&buf, summaries)
+
+	output := buf.String()
+	if !strings.Contains(output, "agent terminated with error (subtype: error_unknown)") {
+		t.Errorf("expected fallback message, got: %q", output)
+	}
+}
+
+func TestEmitTranscriptErrors_NoSummaries(t *testing.T) {
+	var buf bytes.Buffer
+	emitTranscriptErrors(&buf, nil)
+
+	if buf.Len() != 0 {
+		t.Errorf("expected no output for nil summaries, got: %q", buf.String())
+	}
+}
+
+// TestTranscriptError_DisplayMessage pins the one rendering every sink
+// shares: sanitized ErrorMessage, or the sanitized subtype fallback when
+// it comes up empty.
+func TestTranscriptError_DisplayMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		te   TranscriptError
+		want string
+	}{
+		{"plain message", TranscriptError{ErrorMessage: "Agent reached maximum turns"}, "Agent reached maximum turns"},
+		{"injection is sanitized", TranscriptError{ErrorMessage: "API Error\n::error::forged\x1b[31mred"}, "API Error : :error: :forgedred"},
+		{"empty message falls back to subtype", TranscriptError{Subtype: "error_max_turns"}, "agent terminated with error (subtype: error_max_turns)"},
+		{"subtype is sanitized too", TranscriptError{Subtype: "x::y\n"}, "agent terminated with error (subtype: x: :y )"},
+		{"message that sanitizes to empty falls back", TranscriptError{ErrorMessage: "\x1b[31m", Subtype: "error_unknown"}, "agent terminated with error (subtype: error_unknown)"},
+		// A colon run must not reconstitute "::" at a replacement seam.
+		{"colon run stays broken", TranscriptError{ErrorMessage: "x::::y"}, "x: : : :y"},
+		// Subtype is not truncated at parse time the way ErrorMessage is,
+		// and a transcript line can be up to 1MB — the fallback bounds it
+		// with the same truncateError treatment.
+		{"huge subtype is bounded", TranscriptError{Subtype: strings.Repeat("s", 1<<20)},
+			"agent terminated with error (subtype: " + strings.Repeat("s", 2000) + "… (truncated))"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.te.DisplayMessage(); got != tc.want {
+				t.Errorf("DisplayMessage() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseTranscriptFile_APIErrorExitZero covers the scenario from #2786:
+// Claude Code exits 0 with is_error:true and subtype "success" on API errors
+// (e.g., invalid_grant from a stale OIDC token).
+func TestParseTranscriptFile_APIErrorExitZero(t *testing.T) {
+	dir := t.TempDir()
+	// Real-world transcript shape: subtype is "success" but is_error is true.
+	content := `{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"result","subtype":"success","is_error":true,"result":"API Error: Error code invalid_grant: ID Token issued at 1782810237 is stale to sign-in.","session_id":"abc123"}
+`
+	path := filepath.Join(dir, "output.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, ok := parseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected IsError to be true for API error with exit 0")
+	}
+	if summary.Subtype != "success" {
+		t.Errorf("expected subtype 'success', got %q", summary.Subtype)
+	}
+	if !strings.Contains(summary.ErrorMessage, "invalid_grant") {
+		t.Errorf("expected error message to contain 'invalid_grant', got %q", summary.ErrorMessage)
+	}
+}
+
+// TestParseTranscriptErrors_SurfacesErrorRegardlessOfExitCode verifies that
+// parseTranscriptErrors returns errors from transcripts where is_error:true,
+// which is the key fix from #2786 — errors must be surfaced even when the
+// process exit code was 0.
+func TestParseTranscriptErrors_SurfacesErrorRegardlessOfExitCode(t *testing.T) {
+	dir := t.TempDir()
+
+	// Transcript with is_error:true but subtype "success" (API error scenario).
+	content := `{"type":"result","subtype":"success","is_error":true,"result":"API Error: quota exhausted"}`
+	if err := os.WriteFile(filepath.Join(dir, "agent.jsonl"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summaries := parseTranscriptErrors(dir)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 error summary, got %d", len(summaries))
+	}
+	if !summaries[0].IsError {
+		t.Error("expected IsError to be true")
+	}
+	if !strings.Contains(summaries[0].ErrorMessage, "quota exhausted") {
+		t.Errorf("unexpected error message: %q", summaries[0].ErrorMessage)
+	}
+}
+
+// TestClaudeRuntime_ParseTranscriptFile verifies the exported method on
+// ClaudeRuntime satisfies the TranscriptHandler interface.
+func TestClaudeRuntime_ParseTranscriptFile(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"type":"result","subtype":"success","is_error":true,"result":"infrastructure error"}`
+	path := filepath.Join(dir, "output.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var handler TranscriptHandler = ClaudeRuntime{}
+	summary, ok := handler.ParseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected IsError to be true")
+	}
+}
+
+func TestIsResultLine(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{`{"type":"result","is_error":true}`, true},
+		{`{"type": "result", "is_error": true}`, true},
+		{`{"type":"assistant","content":[]}`, false},
+		{`{"type":"system","subtype":"init"}`, false},
+		{`not json at all`, false},
+		{``, false},
+	}
+
+	for _, tt := range tests {
+		got := isResultLine([]byte(tt.line))
+		if got != tt.want {
+			t.Errorf("isResultLine(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}

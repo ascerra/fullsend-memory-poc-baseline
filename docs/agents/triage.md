@@ -1,0 +1,201 @@
+---
+description: How the fullsend triage agent inspects new GitHub issues, assesses information sufficiency, asks clarifying questions, and produces a structured triage decision.
+---
+
+# Triage Agent
+
+![Triage agent icon](icons/triage.png)
+
+Inspects a GitHub issue, assesses information sufficiency, asks clarifying questions when needed, and produces a structured triage decision that determines whether the issue is ready for implementation.
+
+## How the agent works
+
+The triage agent is triggered when a new issue is opened or when an existing issue is updated. On GitLab, opening an issue also dispatches triage when the issue author has Developer access or higher (see [Commands](#commands)). The webhook fast path starts this dispatch, and events-mode cron polling backstops it when a webhook delivery is missed. It fetches the issue content — title, body, labels, comments — and reads repository context (architecture docs, existing issues, PRs) to understand the landscape. It then decides whether the issue has enough information to act on, or whether clarification is needed.
+
+The agent runs in a read-only sandbox. It cannot modify issues, push code, or interact with external services. Its only output is a structured JSON triage result consumed by the post-script, which applies labels and posts a summary comment.
+
+## How it helps
+
+- New issues get a response within minutes instead of waiting for a human to notice them.
+- Issues missing critical information get a clarification request immediately, shortening the feedback loop with the reporter.
+- Well-specified issues are labeled and ready for the [code agent](code.md) without human intervention.
+
+## Commands
+
+| Command | Where | Effect |
+|---------|-------|--------|
+| `/fs-triage` | Issue comment | Runs triage on the issue |
+
+Requires triage-level repository permission or higher (triage, write,
+maintain, or admin). Mutation stages such as `/fs-code` still require
+write or higher.
+
+The `/fs-triage` command does not accept arguments — it re-evaluates the issue
+using current content, comments, and any prior triage analysis.
+
+Triage also runs automatically when a new issue is opened or edited by a
+user with triage-level permission or higher, and when the `ready-for-triage`
+label is applied to an issue (used by the [retro agent](retro.md) to
+route proposal issues into the triage pipeline). To re-trigger triage
+after providing clarification on a `needs-info` issue, use the
+`/fs-triage` command.
+
+On GitLab, the triage-level rule above does not apply. The GitLab agent
+job requires the event actor to hold Developer access or higher
+([ADR 0054](../ADRs/0054-require-authorization-on-all-agent-dispatch-paths.md)),
+so automatic issue-open triage runs only for issues opened by Developer, Maintainer, or
+Owner members. The webhook fast path normally starts the dispatch; if a
+delivery is missed, events-mode cron polling recovers the issue open
+(for issues created after the poller's discovery watermark and its persisted
+issue-open cutoff) and dispatches it with the same authorization rule. When a
+Reporter, Guest, or non-member opens an issue, the
+webhook (or the polling backstop) still starts a dispatch, but the agent job exits successfully
+without running triage. A Developer-or-higher member can then comment
+`/fs-triage` on the issue to start triage.
+
+## Control labels
+
+These labels are managed by the triage agent. It decides the triage
+outcome and the post-script applies the corresponding label.
+
+| Label | Meaning |
+|-------|---------|
+| `needs-info` | The issue lacks sufficient information. The agent posted clarifying questions. |
+| `ready-to-code` | The issue is fully specified and low-risk (bug, documentation, performance). Triggers the [code agent](code.md). |
+| `triaged` | The issue is fully specified but is a feature or other category that requires human prioritization before coding. |
+| `duplicate` | The issue duplicates an existing one. The agent identified the original and the post-script closes the issue. |
+| `blocked` | The issue depends on prerequisites — existing issues/PRs or newly created upstream issues. The agent identified or created the blockers. |
+| `question` | The issue is a support request or question, not an actionable bug or feature. The agent attempted to answer it. |
+
+The `issue-labels` skill may also apply contextual labels (e.g., `area/api`,
+`kind/bug`) but these are informational — they do not control agent behavior.
+
+## Configuration and extension
+
+### Cross-repo issue creation
+
+The triage agent can create prerequisite issues in other repositories when it
+identifies upstream dependencies that don't have tracking issues yet. This is
+controlled by the selected provider's `allowed_targets` under `tracker` in
+`config.yaml` (see the
+[Config Reference](../reference/config-reference.md#tracker) for the GitLab
+and Jira shapes):
+
+```yaml
+tracker:
+  github:
+    allowed_targets:
+      orgs:
+        - my-org
+      repos:
+        - upstream-org/specific-repo
+```
+
+**Defaults:** A fresh GitHub installation without a preset or explicit `tracker`
+setting permits `fullsend-ai/fullsend` and `fullsend-ai/agents` as upstream
+targets. Fresh GitLab installations have an explicit empty cross-project
+allowlist; configure any additional projects on the GitLab host explicitly.
+The repository the agent runs in is always allowed, so it needs no
+entry. Existing installations retain their configured permissions on upgrade;
+see [migration guidance](../guides/getting-started/migrating-from-github-setup.md#permit-agent-improvement-proposals-on-existing-installations)
+to add the agents repository explicitly.
+
+**When to expand the allowlist:** If your project depends on libraries or services
+in other GitHub orgs and you want the triage agent to automatically file
+prerequisite issues there, add those orgs or repos to `allowed_targets`.
+
+**When to restrict the allowlist:** If you don't want agents creating issues
+outside your org, remove entries. If `allowed_targets` is empty, automatic
+prerequisite creation is disabled entirely — the agent will still identify
+the dependency and include a draft issue body in its comment for a human to
+file manually.
+
+The source repo (where triage is running) is always implicitly allowed
+regardless of the allowlist.
+
+### Skill: `issue-labels`
+
+The triage agent includes a built-in `issue-labels` skill that discovers your
+repo's labels and applies them opportunistically during triage. You can encode
+your team's labeling knowledge in a skill, keeping it out of `AGENTS.md`
+(where it would bloat context for every agent).
+
+To **extend** the agent, add a uniquely named skill in `.agents/skills/` and
+symlink `.claude/skills` to `.agents/skills` so it is discoverable by both
+fullsend and local agent tooling. A same-named `issue-labels` skill in that
+directory is shadowed by the built-in version and is ignored.
+
+To **override** the built-in skill, register the triage agent with a harness
+that uses `base:` composition and include your replacement `issue-labels`
+skill in the `skills:` list — see
+[Configuring with Skills](../guides/user/customizing-with-skills.md#overriding-built-in-skills)
+and [Bring Your Own Agent](../guides/user/bring-your-own-agent.md).
+
+Here is an example replacement skill for the override path:
+
+```markdown
+---
+name: issue-labels
+description: >-
+  Apply contextual labels to triaged issues using team labeling conventions.
+---
+
+# Issue Labels
+
+Apply labels to the issue being triaged. Use the conventions below — do not
+invent labels or apply labels not listed here.
+
+## Control labels (never recommend these)
+
+These are managed by the triage pipeline. Never include them in `label_actions`:
+`needs-info`, `ready-to-code`, `duplicate`, `blocked`, `triaged`, `question`.
+
+## Area labels
+
+- `area/api` — REST or gRPC surface in `pkg/api/`.
+- `area/operator` — Kubernetes controller-runtime code in `internal/controller/`.
+  Apply this even if the issue doesn't say "operator" — if it mentions
+  reconciliation, finalizers, or CRDs, it belongs here.
+- `area/ci` — GitHub Actions workflows, Tekton pipelines, build scripts.
+
+## Kind labels
+
+- `kind/bug` — confirmed defect in existing behavior.
+- `kind/flaky-test` — use this instead of `kind/bug` for intermittent test
+  failures. These route to a different team.
+- `kind/feature` — new capability request.
+
+## Priority labels
+
+- `priority/critical` — production outages or data loss only. Do not apply
+  based on user frustration alone.
+
+## Special labels
+
+- `needs/design` — the issue describes a desired outcome but the approach is
+  unclear. When applying this label, do NOT also label `ready-to-code`.
+
+## Output
+
+Include recommendations in `label_actions`:
+
+    "label_actions": {
+      "reason": "Single sentence explaining the label choices.",
+      "actions": [
+        { "action": "add", "label": "area/api" }
+      ]
+    }
+```
+
+This gives the triage agent the subtlety it needs to distinguish between
+`kind/bug` and `kind/flaky-test`, or to know that `area/operator` applies to
+controller-runtime code, without adding label documentation to `AGENTS.md`
+where every agent would pay the context cost.
+
+### Variables
+
+None.
+
+## Source
+
+[`fullsend-ai/agents` — `harness/triage.yaml`](https://github.com/fullsend-ai/agents/blob/main/harness/triage.yaml)

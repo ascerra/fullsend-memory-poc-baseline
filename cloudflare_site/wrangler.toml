@@ -1,0 +1,18 @@
+# Cloudflare Worker + static assets. User Worker entry is worker/src/index.ts (stub passes through ASSETS).
+# Deploy: site-deploy.yml checks out the default branch (trusted TOML), downloads the Build Site artifact to _bundle/, copies only ./public/ and ./worker/ from it, then runs Wrangler here.
+# The workflow passes --name to match your account Worker name (GitHub variable CLOUDFLARE_PROJECT_NAME).
+# See: https://developers.cloudflare.com/workers/static-assets/
+
+name = "documentation-site"
+main = "worker/src/index.ts"
+compatibility_date = "2026-04-09"
+workers_dev = true
+preview_urls = true
+
+# Local dev: `npm run dev:worker` serves ./public through the ASSETS binding.
+
+[assets]
+directory = "./public"
+# Serves the nearest 404.html with HTTP 404 (tries `../404.html` until it matches)
+not_found_handling = "404-page"
+binding = "ASSETS"

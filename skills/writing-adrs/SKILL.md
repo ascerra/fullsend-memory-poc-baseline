@@ -1,0 +1,283 @@
+---
+name: writing-adrs
+description: >-
+  Use when writing, proposing, or accepting Architecture Decision Records (ADRs)
+  in this repo. Use when a decision has crystallized from a problem doc and needs
+  to be recorded, or when updating living documents after an ADR is accepted.
+---
+
+# Writing ADRs
+
+## Overview
+
+An ADR records exactly **one** decision. Problem docs explore; ADRs decide.
+`docs/architecture.md` and problem docs are the current state (mutable). ADRs
+are point-in-time records that can receive minor annotations but should not be
+substantially rewritten.
+
+### ADRs are point-in-time records, not evolving documents
+
+An ADR captures a decision and the context that existed when it was made. It is
+not a living design document -- that role belongs to `docs/architecture.md`.
+
+That said, accepted ADRs are **not 100% frozen**. Minor annotations after the
+fact are welcome and encouraged:
+
+**Acceptable modifications to an accepted ADR:**
+
+- Changing its `status` (e.g., from Accepted to Deprecated or Superseded)
+- Adding cross-reference links to related or superseding ADRs
+- Adding short notes that connect the ADR to newer decisions or clarifications
+- Fixing typos, broken links, or formatting
+
+These annotations keep ADRs useful as navigational aids rather than dead-end
+documents. When a reader lands on an older ADR, links to subsequent decisions
+help them find the current state of thinking.
+
+**Not acceptable -- write a new ADR instead:**
+
+- Substantially rewriting Context to reflect updated understanding
+- Editing the Decision to match a revised approach
+- Modifying Consequences based on what actually happened
+- Turning the ADR into a running log of how the decision evolved
+
+If a decision turned out to be wrong, that is what supersession is for. The
+original ADR remains as a historical record of what was decided and why. For
+ongoing design narrative, use `docs/architecture.md`.
+
+### docs/architecture.md is always current
+
+Unlike ADRs, `docs/architecture.md` is a **living document**. It must always
+reflect the current state of architectural decisions. When a new ADR is accepted
+(or when an ADR supersedes an older one), `docs/architecture.md` must be updated
+to reflect the latest decision. It is the single place a reader can go to
+understand what is true *now*, without tracing a chain of ADRs.
+
+## When to Use
+
+- A specific decision has emerged from discussion in a problem doc
+- You need to frame an upcoming decision
+- An ADR has been accepted and living documents need updating
+
+Do NOT use for open-ended exploration -- that belongs in problem docs.
+
+## The Rules
+
+### One decision per ADR
+
+Each ADR decides a single thing. If you find yourself writing "Additionally, we
+decide..." or "We also require...", stop. That is a second ADR.
+
+### Be concise
+
+- **Context:** 1-3 short paragraphs. Link to problem docs for background
+  instead of restating them.
+- **Decision:** State the decision directly. A few paragraphs at most.
+- **Consequences:** 3-5 bullet points. Each one sentence.
+- **Forge scope:** A few sentences, or one line per forge.
+
+| Section | Target | Anti-pattern |
+|---------|--------|-------------|
+| Context | 1-3 paragraphs | Restating entire problem docs |
+| Options (if any) | 1 paragraph each | Multi-page analysis per option |
+| Decision | Direct statement + brief rationale | Burying the decision in prose |
+| Consequences | 3-5 one-sentence bullets | Essay-length explanations |
+| Forge scope | A few sentences, or one line per forge | Per-forge essays |
+
+### State the aim, then the choice
+
+Close the Context with one sentence stating what this ADR aims to achieve
+(e.g., "This ADR aims to …"). The reader needs it before the Options, because
+Options are judged against it. Then open the Decision with the choice and its
+purpose in one line ("We adopt X to do Y"), before any mechanics.
+
+```markdown
+# Good (end of Context)
+This ADR aims to stop requiring the Administer Projects permission on the
+long-lived Jira polling credential.
+
+# Good (start of Decision)
+We authorize Jira actors through config-owned lists and Jira's own label
+permission to drop that requirement.
+
+# Bad (start of Decision)
+Jira actors are authorized without the project role roster unless a
+repository opts into it: [immediately lists three numbered mechanisms]
+```
+
+### Link, don't repeat
+
+Problem docs exist. Architecture.md exists. Reference them:
+
+```markdown
+# Good
+The threat model establishes least-privilege as a cross-cutting principle
+(see [security-threat-model.md](../problems/security-threat-model.md)).
+
+# Bad
+[3 paragraphs restating the threat model's least-privilege section]
+```
+
+The same applies to sibling ADRs and contracts. When another ADR decides a
+rule, or a `docs/normative/` contract specifies it (often one in the same PR),
+link it in one line instead of restating it, so the two texts cannot drift.
+
+### Cross-reference other ADRs
+
+If this decision builds on or relates to another ADR, say so in Context.
+
+### Keep implementation out of the ADR PR
+
+The recommendation is that implementation does **not** accompany an ADR. An
+ADR PR carries the decision record and the living-document updates. File
+follow-up issues to track the implementation, and land it in separate PRs.
+
+The exception is implementation that is really short and trivial. That will
+rarely be the case. When in doubt, split the implementation out.
+
+### Normative specs (`docs/normative/`)
+
+- **Use** when the decision needs **byte-level or field-level** contracts, JSON
+  Schema (or equivalent), **canonical YAML** or snapshots, or **compatibility
+  / conformance** artifacts aimed at **multiple implementations** or automated
+  checks.
+- **Do not use** for open-ended trade-off exploration (that stays in **problem
+  docs**), for a **single architectural choice** with no large artifact (keep
+  that in the **ADR only**), or for duplicating
+  [ADR 0003](../../docs/ADRs/0003-org-config-repo-convention.md)-style
+  repository convention **without** a versioned contract (do not invent a
+  normative subtree for that).
+- **Relationship:** the **ADR** states the decision, high-level versioning
+  expectations, and **links** to `docs/normative/<topic>/v<major>/...`; the
+  normative folder holds the detailed, **versioned** contract (`v1`, `v2`, …).
+
+## Checklist
+
+Follow these steps in order:
+
+1. **Find the next number.** List `docs/ADRs/` on current `main`, then scan
+   **open pull requests** for new `docs/ADRs/NNNN-*.md` files so you do not
+   collide with in-flight ADRs. Pick the lowest unused four-digit `NNNN`.
+2. **Read the template.** Use `docs/ADRs/0000-adr-template.md` exactly.
+3. **Fill in frontmatter.** `relates_to` must reference existing filenames
+   (without `.md`) from `docs/problems/`. Use `"*"` only for ADRs that truly
+   apply to all problem areas. The `status` in frontmatter must match the
+   `## Status` heading in the body (the linter enforces this). The number in
+   the `title` field and the `# heading` must have **no leading zeros**
+   (e.g., `"1. Use ADRs"`, not `"0001. Use ADRs"`). The four-digit
+   zero-padded format is only for filenames.
+4. **Choose the right status.** Use **Accepted** when the decision is made.
+   Use **Deprecated** or **Superseded** when retiring an ADR. Include an
+   Options section only when there are genuine alternatives worth documenting;
+   if the decision is obvious, just decide it.
+5. **Write the ADR.** Follow the conciseness rules above.
+6. **Cite current behavior.** Verify each claim about how fullsend works today
+   against the code at a specific commit SHA (reading `main` is fine; record
+   its SHA), not general knowledge of the underlying tool. In the ADR, describe
+   it in plain language and link the PR, issue, or ADR that introduced it; put
+   the file or function evidence at that SHA in the PR description, never as
+   code permalinks (`blob/<sha>/…`) in Context or Decision.
+7. **Fill in Forge scope.** State which forges (GitHub, GitLab, Forgejo) the
+   decision applies to and how each is handled. For any forge left out, say so
+   explicitly with a reason or a tracking issue (e.g., "GitHub only; GitLab
+   tracked in #NNN").
+8. **Leave implementation out.** File follow-up issues for the implementation
+   instead of including it in the ADR PR, unless it is really short and
+   trivial (see [Keep implementation out of the ADR
+   PR](#keep-implementation-out-of-the-adr-pr)).
+9. **Run linters.** Stage your changes, then execute `make lint` and fix any errors before committing.
+10. **If status is Accepted, update living documents** (see below).
+
+## Updating Living Documents After Acceptance
+
+When an ADR is accepted, the current-state documents must reflect the decision.
+
+### docs/architecture.md
+
+Add a "Decided:" line or short paragraph under the relevant component. Keep
+the existing structure -- do NOT rewrite entire sections. Add a link to the ADR.
+Remove or annotate open questions that the ADR resolves. Add new open questions
+for consequences that surface new unknowns.
+
+```markdown
+## Agent Sandbox
+
+[existing description unchanged]
+
+**Decided:**
+
+- Filesystem access model: ephemeral read-only source mounts with separate
+  writable workspace ([ADR 0002](ADRs/0002-ephemeral-sandbox-filesystems.md)).
+
+**Open questions:**
+
+- [remaining unanswered questions]
+- [any new questions raised by the ADR's consequences]
+```
+
+### Problem docs
+
+If an ADR resolves an open question in a problem doc, annotate that question
+with a link to the ADR. Do NOT delete the question -- mark it answered:
+
+```markdown
+- ~~How do agents access source code?~~ Decided in
+  [ADR 0002](../ADRs/0002-ephemeral-sandbox-filesystems.md).
+```
+
+If the ADR partially answers a question, add a parenthetical:
+
+```markdown
+- How do we provide agents with resources? (Filesystem access decided in
+  [ADR 0002](../ADRs/0002-ephemeral-sandbox-filesystems.md); tool and API
+  access remain open.)
+```
+
+### What NOT to update
+
+- Do not update documents unrelated to the ADR's `relates_to` problem areas.
+- Do not rewrite sections. Make surgical additions.
+- Do not change the tone or structure of existing prose.
+
+## Red Flags -- Stop and Reconsider
+
+- Context ends without saying what the ADR aims to fix -- close it with "This ADR aims to …"
+- Decision opens with mechanics instead of the choice -- lead with "We adopt X to do Y"
+- Context section restates information from problem docs at length
+- You wrote "Additionally, we decide..." -- split into two ADRs
+- You're rewriting a section of architecture.md -- make a surgical edit instead
+- `relates_to` lists more than 3 problem docs -- the decision may be too broad
+- You didn't stage and run `make lint` -- stop and do it
+- You're substantially rewriting the Context, Decision, or Consequences of an
+  accepted ADR -- write a new superseding ADR instead
+- You're turning an old ADR into a running changelog -- use
+  `docs/architecture.md` for evolving design narrative
+- A limit, timeout, or size in the Decision has no stated basis -- give the
+  basis, or say it is an initial value to revisit and when
+- A sibling ADR or contract version in the same series just merged -- re-check
+  each open ADR's references to its siblings and contract versions
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Bundling multiple decisions | Split into separate ADRs |
+| Bundling non-trivial implementation with the ADR | Land the decision record alone; track implementation in follow-up issues |
+| Context ends without stating the aim | Close it with a "This ADR aims to …" sentence |
+| Decision opens with mechanics, choice buried | Lead with "We adopt X to do Y" |
+| Verbose context | Link to problem docs |
+| Forgetting frontmatter `relates_to` | Check template, list problem doc filenames |
+| Not updating architecture.md | Follow the update checklist above |
+| Rewriting existing doc sections | Make surgical additions only |
+| Skipping linters | Stage changes, then run `make lint` before committing |
+| Wrong ADR number | Check existing files in `docs/ADRs/` first |
+| Substantially rewriting an accepted ADR | Write a new ADR that supersedes it |
+| Omitting cross-references to related ADRs | Link older ADRs to newer related decisions |
+| Treating old ADRs as evolving design docs | Use `docs/architecture.md` for living narrative |
+| Forgetting to update architecture.md | It must always reflect current decisions |
+| Leading zeros in title number | Use `"1. Title"` not `"0001. Title"` — zero-padded numbers are only for filenames |
+| Missing or implicit forge scope (only GitHub mechanisms discussed) | Fill in Forge scope; name every forge left out with a reason or tracking issue |
+| Unverified claims about how fullsend works today, or checking only `main` | Verify against the code at a commit SHA; put the file/function evidence in the PR description |
+| Code permalinks (`blob/<sha>/…`, with or without `#L`) in Context or Decision | Describe the behavior in plain prose and link the PR, issue, or ADR that introduced it |
+| File slug names an option the ADR rejected | Name the slug after the chosen decision |
+| Implementation-status blocks such as "Planned:" in Context | Keep status in Context to one sentence at most; it belongs in `docs/architecture.md` "(target state)" and in issues |

@@ -1,0 +1,41 @@
+name: Notify Slack on ADR merge
+
+# Runs on the push to main that lands a merged PR, not on pull_request_target
+# closed (#9245): GitHub blocks pull_request_target by default from
+# 2026-12-02. One merge-queue push can carry several PRs; the script finds
+# them from the pushed commits and sends one message per PR that changed ADRs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/ADRs/**'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Send Slack notification for merged ADR PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Every commit in the push: a merge-queue push carries each PR's merge commit.
+          COMMIT_SHAS: ${{ toJSON(github.event.commits.*.id) }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          mapfile -t shas < <(jq -r '.[]' <<<"${COMMIT_SHAS}")
+          if [[ ${#shas[@]} -eq 0 ]]; then
+            echo "No commits in this push"
+            exit 0
+          fi
+          bash scripts/notify-adr-merge.sh "${REPO}" "${shas[@]}"

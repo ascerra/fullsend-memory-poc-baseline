@@ -1,0 +1,195 @@
+package config
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+)
+
+func TestEffectiveYAML_LayersOverlayBaseAndDefaults(t *testing.T) {
+	overlay, err := ParsePerRepoConfigWriter([]byte("kill_switch: true\nruntime: pi\nauthorization:\n  - provider: owners_file\n" +
+		"agents:\n  - name: review\n    harness: { timeout_minutes: 90 }\n  - name: code\n    effort: high\n"))
+	require.NoError(t, err)
+	base := []byte(`version: "1"
+keep_history: false
+mint_url: https://mint.example.com
+roles: [triage]
+runtime: claude
+allowed_remote_resources:
+  - https://example.com/
+tracker:
+  github:
+    allowed_targets:
+      repos: [acme/other]
+inference:
+  provider: vertex
+  project: proj
+  region: us-east5
+  wif_provider: projects/1/locations/global/workloadIdentityPools/p/providers/q
+  openai:
+    audience: aud
+    identity_provider_id: idp
+    service_account_id: sa
+models:
+  aliases:
+    fast: some-model
+agents:
+  - name: review
+    harness: { timeout_minutes: 30 }
+  - name: code
+    harness: { timeout_minutes: 60 }
+`)
+	layered, err := LayerOnBase(overlay, base)
+	require.NoError(t, err)
+
+	data, err := EffectiveYAML(layered)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, yaml.Unmarshal(data, &got))
+
+	assert.Equal(t, true, got["kill_switch"], "overlay wins")
+	assert.Equal(t, "pi", got["runtime"], "overlay wins over the base")
+	assert.Equal(t, false, got["keep_history"], "base value")
+	assert.Equal(t, "https://mint.example.com", got["mint_url"])
+	assert.Equal(t, []any{"triage"}, got["roles"])
+	assert.Contains(t, got["allowed_remote_resources"], "https://example.com/", "base prefixes merge with the code defaults")
+	assert.Equal(t, map[string]any{"github": map[string]any{"allowed_targets": map[string]any{"repos": []any{"acme/other"}}}}, got["tracker"])
+	assert.Equal(t, []any{"owners_file"}, got["authorization"])
+	assert.Equal(t, map[string]any{"aliases": map[string]any{"fast": "some-model"}}, got["models"])
+	inference, ok := got["inference"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "vertex", inference["provider"])
+	assert.Equal(t, "proj", inference["project"])
+	assert.Equal(t, "us-east5", inference["region"])
+	assert.Contains(t, inference, "wif_provider")
+	assert.Contains(t, inference, "openai")
+	// Blocks set in both layers compose as two layers, so both are shown, base first.
+	assert.Equal(t, []any{
+		map[string]any{"name": "review", "harness": []any{map[string]any{"timeout_minutes": 30}, map[string]any{"timeout_minutes": 90}}},
+		map[string]any{"name": "code", "effort": "high", "harness": map[string]any{"timeout_minutes": 60}},
+	}, got["agents"])
+}
+
+func TestEffectiveYAML_InheritsInferenceGateway(t *testing.T) {
+	base := []byte(`inference:
+  gateway:
+    url: https://gw.example.com
+    audience: base-aud
+    models:
+      m1:
+        api: openai-completions
+`)
+	overlay, err := ParsePerRepoConfigWriter([]byte("inference:\n  gateway:\n    audience: \"  overlay-aud  \"\n"))
+	require.NoError(t, err)
+	layered, err := LayerOnBase(overlay, base)
+	require.NoError(t, err)
+
+	data, err := EffectiveYAML(layered)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, yaml.Unmarshal(data, &got))
+	inference, ok := got["inference"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, map[string]any{
+		"url":      "https://gw.example.com",
+		"audience": "overlay-aud",
+		"models":   map[string]any{"m1": map[string]any{"api": "openai-completions"}},
+	}, inference["gateway"], "url and models inherit from the base; audience is overridden and trimmed")
+
+	// A configuration without a gateway renders no gateway key.
+	empty, err := LayerOnBase(NewEmptyPerRepoOverlay(), nil)
+	require.NoError(t, err)
+	data, err = EffectiveYAML(empty)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "gateway")
+}
+
+func TestEffectiveYAML_ListsJiraAuthorizationProvider(t *testing.T) {
+	overlay, err := ParsePerRepoConfigWriter([]byte("authorization:\n  - provider: jira\n    write:\n      accounts: [acct]\n"))
+	require.NoError(t, err)
+	layered, err := LayerOnBase(overlay, nil)
+	require.NoError(t, err)
+	data, err := EffectiveYAML(layered)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, yaml.Unmarshal(data, &got))
+	assert.Equal(t, []any{map[string]any{
+		"provider": "jira",
+		"write":    map[string]any{"accounts": []any{"acct"}},
+		"labels":   JiraLabelsEditors,
+	}}, got["authorization"])
+}
+
+func TestEffectiveYAML_JiraPolicyChangesChangeOutput(t *testing.T) {
+	render := func(doc string) string {
+		overlay, err := ParsePerRepoConfigWriter([]byte(doc))
+		require.NoError(t, err)
+		layered, err := LayerOnBase(overlay, nil)
+		require.NoError(t, err)
+		data, err := EffectiveYAML(layered)
+		require.NoError(t, err)
+		return string(data)
+	}
+	base := render("authorization:\n  - provider: jira\n    write:\n      accounts: [acct]\n")
+	assert.NotEqual(t, base, render("authorization:\n  - provider: jira\n    write:\n      accounts: [other]\n"), "a changed list renders differently")
+	assert.NotEqual(t, base, render("authorization:\n  - provider: jira\n    write:\n      accounts: [acct]\n    triage:\n      groups: [g]\n"), "an added triage list renders differently")
+	assert.NotEqual(t, base, render("authorization:\n  - provider: jira\n    write:\n      accounts: [acct]\n    labels: allowlist\n"), "a changed labels rule renders differently")
+	assert.NotEqual(t,
+		render("authorization:\n  - provider: jira\n"),
+		render("authorization:\n  - provider: jira\n    write: {}\n"),
+		"a set but empty list differs from an unset one")
+}
+
+func TestEffectiveYAML_SecretSourceChangesChangeOutput(t *testing.T) {
+	render := func(doc string) string {
+		overlay, err := ParsePerRepoConfigWriter([]byte(doc))
+		require.NoError(t, err)
+		layered, err := LayerOnBase(overlay, nil)
+		require.NoError(t, err)
+		data, err := EffectiveYAML(layered)
+		require.NoError(t, err)
+		return string(data)
+	}
+	doc := func(addr, path string) string {
+		return "connections:\n  corp:\n    kind: vault\n    vault_address: " + addr + "\n" +
+			"secrets:\n  JIRA_TOKEN:\n    connection: corp\n    vault_secrets:\n      - " + path + "\n"
+	}
+	const addr = "https://vault.example.com"
+	const path = "secret/data/{{repo.host}}/{{repo.full_name}}"
+	got := render(doc(addr, path))
+	assert.Contains(t, got, "connections:")
+	assert.Contains(t, got, addr)
+	assert.Contains(t, got, "secrets:")
+	assert.Contains(t, got, path)
+	assert.NotEqual(t, got, render(doc("https://other.example.com", path)), "a changed Vault address renders differently")
+	assert.NotEqual(t, got, render(doc(addr, "secret/data/other")), "a changed secret path renders differently")
+	assert.NotEqual(t, got, render(""), "removing the sources renders differently")
+	assert.NotContains(t, render(""), "connections:")
+	assert.NotContains(t, render(""), "secrets:")
+}
+
+func TestCloneAuthorizationSlice_DeepCopiesJiraLists(t *testing.T) {
+	in := []AuthorizationProvider{{Provider: AuthProviderJira, Write: &JiraActorList{Groups: []string{"g"}}}}
+	out := cloneAuthorizationSlice(in)
+	out[0].Write.Groups[0] = "changed"
+	assert.Equal(t, "g", in[0].Write.Groups[0])
+	assert.Nil(t, out[0].Triage)
+}
+
+func TestEffectiveYAML_CodeDefaultsAndNil(t *testing.T) {
+	layered, err := LayerOnBase(NewEmptyPerRepoOverlay(), nil)
+	require.NoError(t, err)
+	data, err := EffectiveYAML(layered)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, yaml.Unmarshal(data, &got))
+	assert.Equal(t, false, got["kill_switch"])
+	assert.Equal(t, true, got["keep_history"])
+	assert.NotContains(t, got, "agents")
+	assert.NotContains(t, got, "authorization")
+
+	_, err = EffectiveYAML(nil)
+	require.Error(t, err)
+}

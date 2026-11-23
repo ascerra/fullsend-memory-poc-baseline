@@ -1,0 +1,1208 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/dispatch/gcf"
+	"github.com/fullsend-ai/fullsend/internal/ui"
+)
+
+func TestInferenceCommand_HasSubcommands(t *testing.T) {
+	cmd := newInferenceCmd()
+	names := make(map[string]bool)
+	for _, sub := range cmd.Commands() {
+		names[sub.Name()] = true
+	}
+	assert.True(t, names["provision"], "expected provision subcommand")
+	assert.True(t, names["status"], "expected status subcommand")
+	assert.True(t, names["deprovision"], "expected deprovision subcommand")
+	assert.False(t, names["enroll"], "enroll is handled by provision, not a separate subcommand")
+	assert.False(t, names["unenroll"], "unenroll replaced by deprovision")
+}
+
+func TestInferenceCommand_RegisteredInRoot(t *testing.T) {
+	cmd := newRootCmd()
+	found := false
+	for _, sub := range cmd.Commands() {
+		if sub.Use == "inference" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected inference subcommand registered in root")
+}
+
+// --- provision tests ---
+
+func TestInferenceProvisionCmd_RequiresArg(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "accepts 1 arg(s)")
+}
+
+func TestInferenceProvisionCmd_RequiresProject(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--project is required")
+}
+
+func TestInferenceProvisionCmd_RejectsInvalidProjectID(t *testing.T) {
+	tests := []struct {
+		name    string
+		project string
+	}{
+		{"uppercase", "MY-PROJECT"},
+		{"too short", "ab"},
+		{"starts with digit", "1project"},
+		{"starts with hyphen", "-project"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			cmd.SetArgs([]string{"inference", "provision", "acme",
+				"--project", tc.project, "--dry-run"})
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid GCP project ID")
+		})
+	}
+}
+
+func TestInferenceProvisionCmd_Flags(t *testing.T) {
+	cmd := newInferenceProvisionCmd()
+
+	projectFlag := cmd.Flags().Lookup("project")
+	require.NotNil(t, projectFlag, "expected --project flag")
+
+	poolFlag := cmd.Flags().Lookup("pool")
+	require.NotNil(t, poolFlag, "expected --pool flag")
+	assert.Equal(t, "fullsend-inference", poolFlag.DefValue)
+
+	providerFlag := cmd.Flags().Lookup("provider")
+	require.NotNil(t, providerFlag, "expected --provider flag")
+	assert.Equal(t, "github-oidc", providerFlag.DefValue)
+
+	dryRunFlag := cmd.Flags().Lookup("dry-run")
+	require.NotNil(t, dryRunFlag, "expected --dry-run flag")
+
+	assert.Nil(t, cmd.Flags().Lookup("region"), "should not have --region flag")
+}
+
+func TestInferenceProvisionCmd_DetectsOrgMode(t *testing.T) {
+	// Org-scoped: arg without "/"
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	// Should succeed (dry-run prints what would happen)
+	require.NoError(t, err)
+}
+
+func TestInferenceProvisionCmd_DetectsRepoMode(t *testing.T) {
+	// Repo-scoped: arg with "/"
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme/widget",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	// Should succeed (dry-run prints what would happen)
+	require.NoError(t, err)
+}
+
+func TestInferenceProvisionCmd_DryRunOrgSucceeds(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+func TestInferenceProvisionCmd_DryRunRepoSucceeds(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme/widget",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+func TestInferenceProvisionCmd_DryRunCustomPool(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme",
+		"--project", "my-project",
+		"--pool", "custom-pool",
+		"--provider", "custom-provider",
+		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+func TestInferenceProvisionCmd_RejectsInvalidOrgName(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "-invalid",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid")
+}
+
+func TestInferenceProvisionCmd_RejectsPlaceholderOrg(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "x0fullsend0placeholder",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot provision reserved placeholder org")
+}
+
+func TestInferenceProvisionCmd_RejectsPlaceholderOrgInRepoMode(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "x0fullsend0placeholder/somerepo",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot provision reserved placeholder org")
+}
+
+func TestInferenceProvisionCmd_RejectsInvalidRepoFormat(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme/",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid")
+}
+
+func TestInferenceProvisionCmd_DoesNotRequireGitHubToken(t *testing.T) {
+	// Unset all GitHub tokens to prove they're not needed.
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	// Should not fail with "no GitHub token found"
+	require.NoError(t, err)
+}
+
+// --- status tests ---
+
+func TestInferenceStatusCmd_RequiresArg(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "accepts 1 arg(s)")
+}
+
+func TestInferenceStatusCmd_RequiresProject(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "acme"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--project is required")
+}
+
+func TestInferenceStatusCmd_RejectsInvalidProjectID(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "acme",
+		"--project", "UPPER-CASE"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid GCP project ID")
+}
+
+func TestInferenceStatusCmd_Flags(t *testing.T) {
+	cmd := newInferenceStatusCmd()
+
+	projectFlag := cmd.Flags().Lookup("project")
+	require.NotNil(t, projectFlag, "expected --project flag")
+
+	poolFlag := cmd.Flags().Lookup("pool")
+	require.NotNil(t, poolFlag, "expected --pool flag")
+	assert.Equal(t, "fullsend-inference", poolFlag.DefValue)
+
+	providerFlag := cmd.Flags().Lookup("provider")
+	require.NotNil(t, providerFlag, "expected --provider flag")
+	assert.Equal(t, "github-oidc", providerFlag.DefValue)
+
+	formatFlag := cmd.Flags().Lookup("format")
+	require.NotNil(t, formatFlag, "expected --format flag")
+	assert.Equal(t, "text", formatFlag.DefValue)
+
+	assert.Nil(t, cmd.Flags().Lookup("region"), "should not have --region flag")
+}
+
+func TestInferenceStatusCmd_RejectsInvalidFormat(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "acme",
+		"--project", "my-project",
+		"--format", "yaml"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--format must be one of: text, json, env")
+}
+
+func TestInferenceStatusCmd_DoesNotRequireGitHubToken(t *testing.T) {
+	// Unset all GitHub tokens to prove they're not needed.
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	// Status without dry-run will try to reach GCP, which will fail,
+	// but it should NOT fail with "no GitHub token found".
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "acme",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	if err != nil {
+		assert.NotContains(t, err.Error(), "no GitHub token found")
+	}
+}
+
+// --- parseOrgOrRepo tests ---
+
+func TestParseOrgOrRepo_OrgMode(t *testing.T) {
+	org, repo, err := parseOrgOrRepo("acme")
+	require.NoError(t, err)
+	assert.Equal(t, "acme", org)
+	assert.Equal(t, "", repo)
+}
+
+func TestParseOrgOrRepo_RepoMode(t *testing.T) {
+	org, repo, err := parseOrgOrRepo("acme/widget")
+	require.NoError(t, err)
+	assert.Equal(t, "acme", org)
+	assert.Equal(t, "acme/widget", repo)
+}
+
+func TestParseOrgOrRepo_Invalid(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty owner in repo", "/widget", "invalid"},
+		{"empty repo in repo", "acme/", "invalid"},
+		{"leading hyphen", "-acme", "hyphen"},
+		{"trailing hyphen", "acme-", "hyphen"},
+		{"invalid chars", "ac me", "invalid"},
+		{"dots in owner", "ac.me/widget", "invalid"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := parseOrgOrRepo(tc.input)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// --- formatStatusJSON tests ---
+
+func TestFormatStatusJSON(t *testing.T) {
+	result := &inferenceStatusResult{
+		Status:      "healthy",
+		ProjectID:   "my-project",
+		WIFProvider: "projects/123/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc",
+		Details:     []string{"Project number: 123", "WIF provider: found"},
+	}
+
+	output, err := formatStatusJSON(result)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	err = json.Unmarshal([]byte(output), &parsed)
+	require.NoError(t, err)
+
+	assert.Equal(t, "healthy", parsed["status"])
+	assert.Equal(t, "my-project", parsed["FULLSEND_GCP_PROJECT_ID"])
+	assert.Equal(t, "projects/123/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc", parsed["FULLSEND_GCP_WIF_PROVIDER"])
+	details, ok := parsed["details"].([]interface{})
+	require.True(t, ok, "expected details to be an array")
+	assert.Len(t, details, 2)
+}
+
+func TestFormatStatusJSON_Unhealthy(t *testing.T) {
+	result := &inferenceStatusResult{
+		Status:    "error",
+		ProjectID: "my-project",
+		Details:   []string{"Failed to get project number"},
+	}
+
+	output, err := formatStatusJSON(result)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	err = json.Unmarshal([]byte(output), &parsed)
+	require.NoError(t, err)
+
+	assert.Equal(t, "error", parsed["status"])
+	assert.Nil(t, parsed["FULLSEND_GCP_PROJECT_ID"], "should not include config keys when unhealthy")
+	assert.Nil(t, parsed["FULLSEND_GCP_WIF_PROVIDER"], "should not include config keys when unhealthy")
+}
+
+// --- formatStatusEnv tests ---
+
+func TestFormatStatusEnv(t *testing.T) {
+	result := &inferenceStatusResult{
+		Status:      "healthy",
+		ProjectID:   "my-project",
+		WIFProvider: "projects/123/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc",
+	}
+
+	output := formatStatusEnv(result)
+	assert.Contains(t, output, "FULLSEND_INFERENCE_STATUS=healthy")
+	assert.Contains(t, output, "FULLSEND_GCP_PROJECT_ID=my-project")
+	assert.Contains(t, output, "FULLSEND_GCP_WIF_PROVIDER=projects/123/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc")
+	assert.NotContains(t, output, "FULLSEND_GCP_REGION")
+	assert.NotContains(t, output, "Status:")
+}
+
+func TestFormatStatusEnv_Unhealthy(t *testing.T) {
+	result := &inferenceStatusResult{
+		Status:    "unhealthy",
+		ProjectID: "my-project",
+	}
+
+	output := formatStatusEnv(result)
+	assert.Contains(t, output, "FULLSEND_INFERENCE_STATUS=unhealthy")
+	assert.NotContains(t, output, "FULLSEND_GCP_PROJECT_ID")
+	assert.NotContains(t, output, "FULLSEND_GCP_WIF_PROVIDER")
+}
+
+func TestInferenceStatusCmd_RejectsProviderInRepoMode(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "acme/widget",
+		"--project", "my-project",
+		"--provider", "custom-provider"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--provider is not supported in repo-scoped mode")
+}
+
+func TestInferenceStatusCmd_RejectsPlaceholderOrg(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "x0fullsend0placeholder",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot check status of reserved placeholder org")
+}
+
+func TestInferenceStatusCmd_RejectsPlaceholderOrgInRepoMode(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "status", "x0fullsend0placeholder/somerepo",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot check status of reserved placeholder org")
+}
+
+func TestInferenceProvisionCmd_RejectsProviderInRepoMode(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "provision", "acme/widget",
+		"--project", "my-project",
+		"--provider", "custom-provider"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--provider is not supported in repo-scoped mode")
+}
+
+// --- deprovision tests ---
+
+func TestInferenceDeprovisionCmd_RequiresArg(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "accepts 1 arg(s)")
+}
+
+func TestInferenceDeprovisionCmd_RequiresProject(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "acme"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--project is required")
+}
+
+func TestInferenceDeprovisionCmd_RejectsInvalidProjectID(t *testing.T) {
+	tests := []struct {
+		name    string
+		project string
+	}{
+		{"uppercase", "MY-PROJECT"},
+		{"too short", "ab"},
+		{"starts with digit", "1project"},
+		{"starts with hyphen", "-project"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			cmd.SetArgs([]string{"inference", "deprovision", "acme",
+				"--project", tc.project, "--dry-run"})
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid GCP project ID")
+		})
+	}
+}
+
+func TestInferenceDeprovisionCmd_DryRunOrgSucceeds(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "acme",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+func TestInferenceDeprovisionCmd_DryRunRepoSucceeds(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "acme/widget",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+func TestInferenceDeprovisionCmd_RejectsPlaceholderOrg(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "x0fullsend0placeholder",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot deprovision reserved placeholder org")
+}
+
+func TestInferenceDeprovisionCmd_RejectsPlaceholderOrgInRepoMode(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "x0fullsend0placeholder/somerepo",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot deprovision reserved placeholder org")
+}
+
+func TestInferenceDeprovisionCmd_RejectsInvalidOrgName(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "-invalid",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid")
+}
+
+func TestInferenceDeprovisionCmd_RejectsInvalidRepoFormat(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "acme/",
+		"--project", "my-project"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid")
+}
+
+func TestInferenceDeprovisionCmd_RejectsProviderInRepoMode(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "acme/widget",
+		"--project", "my-project",
+		"--provider", "custom-provider"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--provider is not supported in repo-scoped mode")
+}
+
+func TestInferenceDeprovisionCmd_Flags(t *testing.T) {
+	cmd := newInferenceDeprovisionCmd()
+
+	projectFlag := cmd.Flags().Lookup("project")
+	require.NotNil(t, projectFlag, "expected --project flag")
+
+	poolFlag := cmd.Flags().Lookup("pool")
+	require.NotNil(t, poolFlag, "expected --pool flag")
+	assert.Equal(t, "fullsend-inference", poolFlag.DefValue)
+
+	providerFlag := cmd.Flags().Lookup("provider")
+	require.NotNil(t, providerFlag, "expected --provider flag")
+	assert.Equal(t, "github-oidc", providerFlag.DefValue)
+
+	dryRunFlag := cmd.Flags().Lookup("dry-run")
+	require.NotNil(t, dryRunFlag, "expected --dry-run flag")
+}
+
+func TestInferenceDeprovisionCmd_DoesNotRequireGitHubToken(t *testing.T) {
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"inference", "deprovision", "acme",
+		"--project", "my-project",
+		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+// --- runInferenceStatus integration tests ---
+
+func newStatusCmd(client gcf.GCFClient) (*cobra.Command, *bytes.Buffer) {
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	return cmd, &buf
+}
+
+func TestRunInferenceStatus_RepoConditionMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository == 'acme/widget'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_ProviderNotUsable(t *testing.T) {
+	tests := []struct {
+		name       string
+		info       gcf.WIFProviderInfo
+		wantDetail string
+	}{
+		{
+			// providers.get returns a soft-deleted provider with 200 and
+			// its condition intact, so the condition check alone passes.
+			name:       "soft-deleted",
+			info:       gcf.WIFProviderInfo{AttributeCondition: "assertion.repository == 'acme/widget'", State: "DELETED"},
+			wantDetail: "WIF provider state is DELETED",
+		},
+		{
+			name:       "disabled",
+			info:       gcf.WIFProviderInfo{AttributeCondition: "assertion.repository == 'acme/widget'", State: "ACTIVE", Disabled: true},
+			wantDetail: "WIF provider is disabled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := tt.info
+			client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&info))
+			cmd, buf := newStatusCmd(client)
+			err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "json", client)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "unhealthy")
+
+			var parsed map[string]interface{}
+			require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+			assert.Equal(t, "unhealthy", parsed["status"])
+			assert.Contains(t, buf.String(), tt.wantDetail)
+		})
+	}
+}
+
+func TestRunInferenceStatus_OrgProviderDisabled(t *testing.T) {
+	client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+		AttributeCondition: "assertion.repository_owner == 'acme'",
+		State:              gcf.WIFProviderStateActive,
+		Disabled:           true,
+	}))
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.Error(t, err)
+	assert.Contains(t, buf.String(), "WIF provider is disabled")
+}
+
+func TestRunInferenceStatus_TextFormatUnhealthyHasNoConditionClaim(t *testing.T) {
+	// The condition matches; only the state is wrong, so the headline must
+	// not blame the condition.
+	client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+		AttributeCondition: "assertion.repository == 'acme/widget'",
+		State:              "DELETED",
+	}))
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "text", client)
+	require.Error(t, err)
+	assert.Contains(t, buf.String(), "Status: unhealthy")
+	assert.NotContains(t, buf.String(), "condition mismatch")
+	assert.Contains(t, buf.String(), "WIF provider state is DELETED")
+}
+
+func TestRunInferenceStatus_ActiveProviderHealthy(t *testing.T) {
+	client := gcf.NewFakeGCFClient(gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+		AttributeCondition: "assertion.repository == 'acme/widget'",
+		State:              gcf.WIFProviderStateActive,
+	}))
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_RepoConditionCaseInsensitiveMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "redhatproductsecurity", "redhatproductsecurity/osidb-bindings", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_RepoConditionMismatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository == 'acme/widget'",
+		}),
+	)
+	cmd, _ := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "acme/other-repo", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unhealthy")
+}
+
+func TestRunInferenceStatus_OrgConditionMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_OrgConditionCaseInsensitiveMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'GoogleCloudPlatform'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "googlecloudplatform", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_OrgMultiOrgPoolMatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner in ['acme', 'BigCorp']",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "bigcorp", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "healthy", parsed["status"])
+}
+
+func TestRunInferenceStatus_OrgConditionMismatch(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, _ := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "other-org", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unhealthy")
+}
+
+func TestRunInferenceStatus_NotProvisioned(t *testing.T) {
+	client := gcf.NewFakeGCFClient()
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "json", client)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &parsed))
+	assert.Equal(t, "not_provisioned", parsed["status"])
+}
+
+func TestRunInferenceStatus_EnvFormat(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "env", client)
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "FULLSEND_INFERENCE_STATUS=healthy")
+}
+
+func TestRunInferenceStatus_TextFormat(t *testing.T) {
+	client := gcf.NewFakeGCFClient(
+		gcf.WithFakeWIFProvider(&gcf.WIFProviderInfo{
+			AttributeCondition: "assertion.repository_owner == 'acme'",
+		}),
+	)
+	cmd, buf := newStatusCmd(client)
+	err := runInferenceStatus(cmd, "acme", "", "my-project", "fullsend-inference", "github-oidc", "text", client)
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "Status: healthy")
+}
+
+// --- conditionMatchesRepo tests ---
+
+func TestConditionMatchesRepo_ExactCase(t *testing.T) {
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'acme/widget'",
+		"acme/widget",
+	))
+}
+
+func TestConditionMatchesRepo_MixedCaseOrg(t *testing.T) {
+	// GitHub OIDC tokens preserve canonical display case.
+	// A provision with mixed-case input writes a mixed-case condition,
+	// and status should report it as healthy.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		"RedHatProductSecurity/osidb-bindings",
+	))
+}
+
+func TestConditionMatchesRepo_CaseInsensitiveMatch(t *testing.T) {
+	// Condition was provisioned with mixed case; status queried with lowercase.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		"redhatproductsecurity/osidb-bindings",
+	))
+	// Condition was provisioned with lowercase; status queried with mixed case.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'redhatproductsecurity/osidb-bindings'",
+		"RedHatProductSecurity/osidb-bindings",
+	))
+}
+
+func TestConditionMatchesRepo_Mismatch(t *testing.T) {
+	assert.False(t, conditionMatchesRepo(
+		"assertion.repository == 'acme/widget'",
+		"acme/other-repo",
+	))
+}
+
+// --- conditionMatchesOrg tests ---
+
+func TestConditionMatchesOrg_ExactCase(t *testing.T) {
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'acme'",
+		"acme",
+	))
+}
+
+func TestConditionMatchesOrg_MixedCaseOrg(t *testing.T) {
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'GoogleCloudPlatform'",
+		"GoogleCloudPlatform",
+	))
+}
+
+func TestConditionMatchesOrg_CaseInsensitiveMatch(t *testing.T) {
+	// Condition was provisioned with mixed case; status queried with lowercase.
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'GoogleCloudPlatform'",
+		"googlecloudplatform",
+	))
+	// Condition was provisioned with lowercase; status queried with mixed case.
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'googlecloudplatform'",
+		"GoogleCloudPlatform",
+	))
+}
+
+func TestConditionMatchesOrg_MultiOrgPool(t *testing.T) {
+	condition := "assertion.repository_owner in ['acme', 'BigCorp']"
+	assert.True(t, conditionMatchesOrg(condition, "acme"))
+	assert.True(t, conditionMatchesOrg(condition, "BigCorp"))
+	assert.True(t, conditionMatchesOrg(condition, "bigcorp"))
+	assert.True(t, conditionMatchesOrg(condition, "ACME"))
+}
+
+func TestConditionMatchesOrg_Mismatch(t *testing.T) {
+	assert.False(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'acme'",
+		"other-org",
+	))
+}
+
+// --- provision --forge gitlab tests ---
+
+func TestInferenceProvisionCmd_GitLabFlags(t *testing.T) {
+	cmd := newInferenceProvisionCmd()
+
+	forgeFlag := cmd.Flags().Lookup("forge")
+	require.NotNil(t, forgeFlag, "expected --forge flag")
+	assert.Equal(t, "github", forgeFlag.DefValue)
+
+	require.NotNil(t, cmd.Flags().Lookup("gitlab-project-id"), "expected --gitlab-project-id flag")
+
+	urlFlag := cmd.Flags().Lookup("gitlab-url")
+	require.NotNil(t, urlFlag, "expected --gitlab-url flag")
+	assert.Equal(t, "https://gitlab.com", urlFlag.DefValue)
+}
+
+func TestInferenceProvisionCmd_GitLabDryRun(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "provision", "acme/team/app",
+		"--forge", "gitlab",
+		"--gitlab-project-id", "12345",
+		"--gitlab-url", "https://gitlab.example.com",
+		"--project", "my-project",
+		"--dry-run"})
+	require.NoError(t, cmd.Execute())
+
+	out := buf.String()
+	assert.Contains(t, out, "gl-acme-team-app")
+	assert.Contains(t, out, "https://gitlab.example.com")
+	assert.Contains(t, out, "assertion.project_id == '12345' && assertion.project_path == 'acme/team/app'")
+	assert.Contains(t, out, "attribute.project_path/acme/team/app")
+}
+
+func TestInferenceProvisionCmd_GitLabValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "missing project id",
+			args:    []string{"acme/app", "--forge", "gitlab"},
+			wantErr: "--gitlab-project-id is required",
+		},
+		{
+			name:    "invalid project id",
+			args:    []string{"acme/app", "--forge", "gitlab", "--gitlab-project-id", "abc"},
+			wantErr: "invalid GitLab project ID",
+		},
+		{
+			name:    "invalid project path",
+			args:    []string{"app", "--forge", "gitlab", "--gitlab-project-id", "1"},
+			wantErr: "invalid GitLab project path",
+		},
+		{
+			name:    "invalid gitlab url",
+			args:    []string{"acme/app", "--forge", "gitlab", "--gitlab-project-id", "1", "--gitlab-url", "http://gitlab.example.com"},
+			wantErr: "invalid GitLab URL",
+		},
+		{
+			name:    "provider rejected",
+			args:    []string{"acme/app", "--forge", "gitlab", "--gitlab-project-id", "1", "--provider", "x"},
+			wantErr: "--provider is not supported with --forge gitlab",
+		},
+		{
+			name:    "gitlab flags need gitlab forge",
+			args:    []string{"acme/app", "--gitlab-project-id", "1"},
+			wantErr: "require --forge gitlab",
+		},
+		{
+			name:    "unknown forge",
+			args:    []string{"acme/app", "--forge", "forgejo"},
+			wantErr: "--forge must be one of",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newRootCmd()
+			args := append([]string{"inference", "provision"}, tc.args...)
+			args = append(args, "--project", "my-project", "--dry-run")
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestRunInferenceProvisionGitLab(t *testing.T) {
+	gl := gcf.GitLabProject{Path: "acme/team/app", ID: "12345"}
+
+	t.Run("success prints handoff", func(t *testing.T) {
+		client := gcf.NewFakeGCFClient()
+		cmd, buf := newStatusCmd(client)
+		err := runInferenceProvisionGitLab(cmd, ui.New(buf), gl, "my-project", "fullsend-inference", client, newFakeServiceUsage())
+		require.NoError(t, err)
+		out := buf.String()
+		assert.Contains(t, out, "providers/gl-acme-team-app")
+		assert.Contains(t, out, "fullsend repos install acme/team/app")
+		assert.Contains(t, out, "--vertex-wif-provider=projects/")
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		client := gcf.NewFakeGCFClient(gcf.WithFakeErrors(map[string]error{
+			"SetProjectIAMBinding": errors.New("denied"),
+		}))
+		cmd, buf := newStatusCmd(client)
+		err := runInferenceProvisionGitLab(cmd, ui.New(buf), gl, "my-project", "fullsend-inference", client, newFakeServiceUsage())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "provisioning WIF for inference")
+	})
+
+	t.Run("enables missing APIs and retries", func(t *testing.T) {
+		noSleep(t)
+		su := newFakeServiceUsage("iam.googleapis.com")
+		client := &flakyProjectNumberClient{GCFClient: gcf.NewFakeGCFClient(), failures: 1}
+		cmd, buf := newProvisionCmd()
+		err := runInferenceProvisionGitLab(cmd, ui.New(buf), gl, "my-project", "fullsend-inference", client, su)
+		require.NoError(t, err)
+		assert.Equal(t, [][]string{{"iam.googleapis.com"}}, su.enableCalls)
+		assert.Contains(t, buf.String(), "providers/gl-acme-team-app")
+	})
+}
+
+// --- inference provision API enablement ---
+
+// fakeServiceUsage is an in-memory gcf.ServiceUsageClient.
+type fakeServiceUsage struct {
+	disabled    map[string]bool
+	checkErr    error
+	enableErr   error
+	enableCalls [][]string
+}
+
+func newFakeServiceUsage(disabled ...string) *fakeServiceUsage {
+	f := &fakeServiceUsage{disabled: map[string]bool{}}
+	for _, s := range disabled {
+		f.disabled[s] = true
+	}
+	return f
+}
+
+func (f *fakeServiceUsage) ServiceEnabled(_ context.Context, _, service string) (bool, error) {
+	if f.checkErr != nil {
+		return false, f.checkErr
+	}
+	return !f.disabled[service], nil
+}
+
+func (f *fakeServiceUsage) EnableServices(_ context.Context, _ string, services []string) error {
+	f.enableCalls = append(f.enableCalls, services)
+	if f.enableErr != nil {
+		return f.enableErr
+	}
+	for _, s := range services {
+		delete(f.disabled, s)
+	}
+	return nil
+}
+
+// flakyProjectNumberClient fails GetProjectNumber with a SERVICE_DISABLED
+// error for the first failures calls (negative: always), simulating API
+// activation lag.
+type flakyProjectNumberClient struct {
+	gcf.GCFClient
+	failures int
+	calls    int
+}
+
+func (c *flakyProjectNumberClient) GetProjectNumber(ctx context.Context, projectID string) (string, error) {
+	c.calls++
+	if c.failures < 0 || c.calls <= c.failures {
+		return "", errors.New("unexpected status 403 looking up project: Cloud Resource Manager API has not been used in project 123 before or it is disabled. Enable it by visiting the console then retry.")
+	}
+	return c.GCFClient.GetProjectNumber(ctx, projectID)
+}
+
+// noSleep replaces inferenceSleepFn with a recorder for the test's duration.
+func noSleep(t *testing.T) *[]time.Duration {
+	t.Helper()
+	var slept []time.Duration
+	orig := inferenceSleepFn
+	inferenceSleepFn = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return ctx.Err()
+	}
+	t.Cleanup(func() { inferenceSleepFn = orig })
+	return &slept
+}
+
+func newProvisionCmd() (*cobra.Command, *bytes.Buffer) {
+	cmd, buf := newStatusCmd(nil)
+	cmd.SetContext(context.Background())
+	return cmd, buf
+}
+
+func TestRunInferenceProvision_APIsAlreadyEnabled(t *testing.T) {
+	slept := noSleep(t)
+	su := newFakeServiceUsage()
+	client := gcf.NewFakeGCFClient()
+	cmd, buf := newProvisionCmd()
+
+	err := runInferenceProvision(cmd, ui.New(buf), "acme", "acme/widget", "my-project", "fullsend-inference", "github-oidc", client, su)
+	require.NoError(t, err)
+	assert.Empty(t, su.enableCalls)
+	assert.Empty(t, *slept)
+	assert.Contains(t, buf.String(), "Required GCP APIs already enabled")
+	assert.Contains(t, buf.String(), "fullsend github setup acme/widget")
+}
+
+func TestRunInferenceProvision_EnablesAPIsAndRetries(t *testing.T) {
+	slept := noSleep(t)
+	su := newFakeServiceUsage("iam.googleapis.com", "aiplatform.googleapis.com")
+	client := &flakyProjectNumberClient{GCFClient: gcf.NewFakeGCFClient(), failures: 2}
+	cmd, buf := newProvisionCmd()
+
+	err := runInferenceProvision(cmd, ui.New(buf), "acme", "", "my-project", "fullsend-inference", "github-oidc", client, su)
+	require.NoError(t, err)
+	assert.Equal(t, [][]string{{"iam.googleapis.com", "aiplatform.googleapis.com"}}, su.enableCalls)
+	assert.Equal(t, inferenceAPIRetryDelays[:2], *slept)
+	assert.Equal(t, 3, client.calls)
+	out := buf.String()
+	assert.Contains(t, out, "Enabled GCP APIs: iam.googleapis.com, aiplatform.googleapis.com")
+	assert.Contains(t, out, "retrying in")
+	assert.Contains(t, out, "fullsend github setup acme")
+}
+
+func TestRunInferenceProvision_RetriesAreBounded(t *testing.T) {
+	slept := noSleep(t)
+	su := newFakeServiceUsage("iam.googleapis.com")
+	client := &flakyProjectNumberClient{GCFClient: gcf.NewFakeGCFClient(), failures: -1}
+	cmd, buf := newProvisionCmd()
+
+	err := runInferenceProvision(cmd, ui.New(buf), "acme", "", "my-project", "fullsend-inference", "github-oidc", client, su)
+	require.Error(t, err)
+	assert.Equal(t, inferenceAPIRetryDelays, *slept)
+	assert.Equal(t, len(inferenceAPIRetryDelays)+1, client.calls)
+	assert.Contains(t, err.Error(), "provisioning WIF for inference")
+	assert.Contains(t, err.Error(), "gcloud services enable iam.googleapis.com cloudresourcemanager.googleapis.com aiplatform.googleapis.com --project=my-project")
+}
+
+func TestRunInferenceProvision_EnableFailsFallsBackToManualInstructions(t *testing.T) {
+	slept := noSleep(t)
+	su := newFakeServiceUsage("aiplatform.googleapis.com")
+	su.enableErr = errors.New("permission denied")
+	client := &flakyProjectNumberClient{GCFClient: gcf.NewFakeGCFClient(), failures: -1}
+	cmd, buf := newProvisionCmd()
+
+	err := runInferenceProvision(cmd, ui.New(buf), "acme", "", "my-project", "fullsend-inference", "github-oidc", client, su)
+	require.Error(t, err)
+	assert.Empty(t, *slept, "no retries when APIs were not enabled by this run")
+	assert.Equal(t, 1, client.calls)
+	out := buf.String()
+	assert.Contains(t, out, "Could not enable GCP APIs: permission denied")
+	assert.Contains(t, out, "gcloud services enable aiplatform.googleapis.com --project=my-project")
+	assert.Contains(t, err.Error(), "required GCP APIs are not enabled")
+}
+
+func TestRunInferenceProvision_CheckFailsStillProvisions(t *testing.T) {
+	noSleep(t)
+	su := newFakeServiceUsage()
+	su.checkErr = errors.New("serviceusage.services.get denied")
+	client := gcf.NewFakeGCFClient()
+	cmd, buf := newProvisionCmd()
+
+	err := runInferenceProvision(cmd, ui.New(buf), "acme", "", "my-project", "fullsend-inference", "github-oidc", client, su)
+	require.NoError(t, err)
+	assert.Empty(t, su.enableCalls)
+	out := buf.String()
+	assert.Contains(t, out, "Could not check GCP API status")
+	assert.Contains(t, out, "gcloud services enable iam.googleapis.com cloudresourcemanager.googleapis.com aiplatform.googleapis.com --project=my-project")
+	assert.Contains(t, out, "WIF infrastructure ready")
+}
+
+func TestRunInferenceProvision_NonAPIErrorNotRetried(t *testing.T) {
+	slept := noSleep(t)
+	su := newFakeServiceUsage("iam.googleapis.com")
+	client := gcf.NewFakeGCFClient(gcf.WithFakeErrors(map[string]error{
+		"SetProjectIAMBinding": errors.New("denied"),
+	}))
+	cmd, buf := newProvisionCmd()
+
+	err := runInferenceProvision(cmd, ui.New(buf), "acme", "", "my-project", "fullsend-inference", "github-oidc", client, su)
+	require.Error(t, err)
+	assert.Empty(t, *slept)
+	assert.NotContains(t, err.Error(), "gcloud services enable")
+}
+
+func TestProvisionWithAPIRetry_StopsOnContextCancel(t *testing.T) {
+	orig := inferenceSleepFn
+	t.Cleanup(func() { inferenceSleepFn = orig })
+	inferenceSleepFn = func(context.Context, time.Duration) error { return context.Canceled }
+
+	calls := 0
+	apiErr := errors.New("SERVICE_DISABLED")
+	_, err := provisionWithAPIRetry(context.Background(), ui.New(&bytes.Buffer{}), "my-project", true, func() (string, error) {
+		calls++
+		return "", apiErr
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, apiErr)
+	assert.Equal(t, 1, calls)
+}
+
+func TestInferenceSleep(t *testing.T) {
+	require.NoError(t, inferenceSleepFn(context.Background(), time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, inferenceSleepFn(ctx, time.Hour), context.Canceled)
+}
+
+func TestInferenceClients(t *testing.T) {
+	client := gcf.NewFakeGCFClient()
+	su := newFakeServiceUsage()
+	gotClient, gotSU := inferenceClients("my-project", client, su)
+	assert.Same(t, client, gotClient)
+	assert.Same(t, su, gotSU)
+
+	gotClient, gotSU = inferenceClients("my-project", nil, nil)
+	_, ok := gotClient.(*gcf.LiveGCFClient)
+	assert.True(t, ok)
+	_, ok = gotSU.(*gcf.LiveGCFClient)
+	assert.True(t, ok)
+}
+
+func TestInferenceProvisionCmd_DryRunListsAPIs(t *testing.T) {
+	for _, args := range [][]string{
+		{"acme"},
+		{"acme/team/app", "--forge", "gitlab", "--gitlab-project-id", "12345"},
+	} {
+		var buf bytes.Buffer
+		cmd := newRootCmd()
+		cmd.SetOut(&buf)
+		cmd.SetArgs(append(append([]string{"inference", "provision"}, args...), "--project", "my-project", "--dry-run"))
+		require.NoError(t, cmd.Execute())
+		assert.Contains(t, buf.String(), "GCP APIs (enabled if missing): iam.googleapis.com, cloudresourcemanager.googleapis.com, aiplatform.googleapis.com")
+	}
+}

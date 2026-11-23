@@ -1,0 +1,1630 @@
+package appsetup
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
+	"github.com/fullsend-ai/fullsend/internal/ui"
+)
+
+// --- fakes ---
+
+type fakePrompter struct {
+	confirmResult  bool
+	confirmErr     error
+	waitCalled     bool
+	confirmCalled  bool
+	readLineResult string
+	readLineCalled bool
+}
+
+func (f *fakePrompter) WaitForEnter(_ string) error {
+	f.waitCalled = true
+	return nil
+}
+
+func (f *fakePrompter) Confirm(_ string) (bool, error) {
+	f.confirmCalled = true
+	return f.confirmResult, f.confirmErr
+}
+
+func (f *fakePrompter) ReadLine(_ string) (string, error) {
+	f.readLineCalled = true
+	return f.readLineResult, nil
+}
+
+type fakeBrowser struct {
+	urlCh chan string
+}
+
+func newFakeBrowser() *fakeBrowser {
+	return &fakeBrowser{urlCh: make(chan string, 1)}
+}
+
+func (f *fakeBrowser) Open(_ context.Context, url string) error {
+	f.urlCh <- url
+	return nil
+}
+
+// --- tests ---
+
+func TestAppSlug(t *testing.T) {
+	assert.Equal(t, "fullsend-ai-fullsend", AppSlug("fullsend-ai", "fullsend"))
+	assert.Equal(t, "fullsend-ai-triage", AppSlug("fullsend-ai", "triage"))
+	assert.Equal(t, "custom-coder", AppSlug("custom", "coder"))
+	assert.Equal(t, "fullsend-review", AppSlug("fullsend", "review"))
+}
+
+func TestResolvePersistedAppSet(t *testing.T) {
+	tests := []struct {
+		name     string
+		explicit string
+		existing string
+		want     string
+	}{
+		{"explicit wins over existing", "custom", "other", "custom"},
+		{"explicit wins over absent", "custom", "", "custom"},
+		{"preserve existing when not explicit", "", "other", "other"},
+		{"default when both absent", "", "", DefaultAppSet},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ResolvePersistedAppSet(tc.explicit, tc.existing))
+		})
+	}
+}
+
+func TestValidateAppSet(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid simple", "fullsend", false},
+		{"valid with hyphen", "fullsend-ai", false},
+		{"valid multi hyphen", "my-custom-app", false},
+		{"valid numeric", "app2", false},
+		{"valid starts with number", "42apps", false},
+		{"empty", "", true},
+		{"uppercase", "FullSend", true},
+		{"leading hyphen", "-fullsend", true},
+		{"trailing hyphen", "fullsend-", true},
+		{"consecutive hyphens", "full--send", true},
+		{"underscore", "full_send", true},
+		{"space", "full send", true},
+		{"special chars", "special!chars", true},
+		{"too long", "a2345678901234567890123x", true},
+		{"max length ok", "a234567890123456789012x", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateAppSet(tc.input)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestSetup_NonDefaultAppSet_FlowsThrough(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 200, AppID: 20, AppSlug: "custom-prefix-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"custom-prefix-fullsend": "Iv1.custom123",
+		},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("custom-prefix").
+		WithSecretExists(func(_ string) (bool, error) {
+			return true, nil
+		})
+
+	creds, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+
+	assert.Equal(t, 20, creds.AppID)
+	assert.Equal(t, "custom-prefix-fullsend", creds.Slug)
+	assert.Equal(t, "Iv1.custom123", creds.ClientID)
+}
+
+func TestSetup_ExistingApp_SecretExists_AutoReuse(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.fullsend123",
+		},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) {
+			return true, nil
+		})
+
+	creds, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+
+	// Should return credentials signaling reuse (empty PEM).
+	assert.Equal(t, 10, creds.AppID)
+	assert.Equal(t, "fullsend-fullsend", creds.Slug)
+	assert.Equal(t, "Iv1.fullsend123", creds.ClientID)
+	assert.Empty(t, creds.PEM, "PEM should be empty to signal reuse")
+	// Should NOT have prompted — auto-reuse is silent.
+	assert.False(t, prompter.confirmCalled, "should not prompt for reuse")
+}
+
+func TestSetup_ExistingApp_Reuse_StoreSecretNotCalled(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.fullsend123",
+		},
+	}
+	printer := ui.New(&discardWriter{})
+
+	storeCalled := false
+	s := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil }).
+		WithStoreSecret(func(_ context.Context, _, _ string) error {
+			storeCalled = true
+			return nil
+		})
+
+	creds, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+	assert.Empty(t, creds.PEM)
+	assert.False(t, storeCalled, "storeSecret should not be called on reuse")
+}
+
+func TestSetup_RecoverCreatedApp_PEMExists(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-coder": "Iv1.coder456",
+		},
+	}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	creds, err := s.recoverCreatedApp(context.Background(), "myorg", "coder", "fullsend-coder")
+	require.NoError(t, err)
+	require.NotNil(t, creds)
+	assert.Equal(t, "fullsend-coder", creds.Slug)
+	assert.Equal(t, "Iv1.coder456", creds.ClientID)
+	assert.Empty(t, creds.PEM, "PEM should be empty — already stored")
+}
+
+func TestSetup_RecoverCreatedApp_KnownSlug(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"custom-coder-app": "Iv1.custom789",
+		},
+	}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithKnownSlugs(map[string]string{"coder": "custom-coder-app"}).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	creds, err := s.recoverCreatedApp(context.Background(), "myorg", "coder", "fullsend-coder")
+	require.NoError(t, err)
+	require.NotNil(t, creds)
+	assert.Equal(t, "custom-coder-app", creds.Slug)
+	assert.Equal(t, "Iv1.custom789", creds.ClientID)
+}
+
+func TestSetup_RecoverCreatedApp_NoPEM(t *testing.T) {
+	client := &forge.FakeClient{}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return false, nil })
+
+	creds, err := s.recoverCreatedApp(context.Background(), "myorg", "coder", "fullsend-coder")
+	require.NoError(t, err)
+	assert.Nil(t, creds, "should return nil when no PEM exists")
+}
+
+func TestSetup_RecoverCreatedApp_NoSecretExistsFunc(t *testing.T) {
+	client := &forge.FakeClient{}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend")
+
+	creds, err := s.recoverCreatedApp(context.Background(), "myorg", "coder", "fullsend-coder")
+	require.NoError(t, err)
+	assert.Nil(t, creds, "should return nil when no secretExists func")
+}
+
+func TestSetup_ExistingApp_NoSecret(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-triage": "Iv1.triage123",
+		},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) {
+			return false, nil
+		})
+
+	_, err := s.Run(context.Background(), "myorg", "triage")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "private key")
+}
+
+func TestSetup_ExistingApp_ThirdParty_NoSecret_ReturnsError(t *testing.T) {
+	// A third-party app (owned by another org) is installed but has no
+	// secret. The CLI should NOT enter PEM recovery (which would open a
+	// 404 URL) but instead return a clear error.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage", AppOwnerLogin: "other-org"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-triage": "Iv1.triage123",
+		},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) {
+			return false, nil
+		})
+
+	_, err := s.Run(context.Background(), "myorg", "triage")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "third-party app")
+	assert.Contains(t, err.Error(), "other-org")
+	// Should NOT have prompted for PEM recovery.
+	assert.False(t, prompter.confirmCalled, "should not prompt for PEM recovery on third-party app")
+	assert.False(t, prompter.readLineCalled, "should not ask for PEM file path on third-party app")
+}
+
+func TestSetup_ExistingApp_ThirdParty_WithSecret_Reuses(t *testing.T) {
+	// A third-party app with a valid secret should be reused normally.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage", AppOwnerLogin: "other-org"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-triage": "Iv1.triage123",
+		},
+	}
+	prompter := &fakePrompter{}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) {
+			return true, nil
+		})
+
+	creds, err := s.Run(context.Background(), "myorg", "triage")
+	require.NoError(t, err)
+	assert.Equal(t, 10, creds.AppID)
+	assert.Equal(t, "fullsend-triage", creds.Slug)
+	assert.Empty(t, creds.PEM, "PEM should be empty to signal reuse")
+}
+
+func TestSetup_ExistingApp_OrgOwned_NoSecret_EntersRecovery(t *testing.T) {
+	// An org-owned app without a secret should enter PEM recovery as before.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage", AppOwnerLogin: "myorg"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-triage": "Iv1.triage123",
+		},
+	}
+	prompter := &fakePrompter{confirmResult: false} // decline recovery
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) {
+			return false, nil
+		})
+
+	_, err := s.Run(context.Background(), "myorg", "triage")
+	require.Error(t, err)
+	// Should have entered recovery (prompted), then failed because user declined.
+	assert.True(t, prompter.confirmCalled, "should prompt for PEM recovery on org-owned app")
+	assert.Contains(t, err.Error(), "private key secret is missing")
+}
+
+func TestSetup_ExistingApp_NoSecretExistsFunc_StillChecksPermissions(t *testing.T) {
+	// When no secretExists callback is configured (e.g. github setup in
+	// OIDC mint mode with no local GCP project), existing apps should be
+	// reused without prompting for a PEM file while still reporting permission
+	// drift.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage", Permissions: map[string]string{
+				"contents": "read",
+			}},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-triage": "Iv1.triage123",
+		},
+	}
+	prompter := &fakePrompter{}
+	var output bytes.Buffer
+	printer := ui.New(&output)
+
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend")
+	// Deliberately NOT calling WithSecretExists — simulates the OIDC
+	// mint-URL-only path where the remote mint manages PEMs.
+
+	creds, err := s.Run(context.Background(), "myorg", "triage")
+	require.NoError(t, err)
+	assert.Equal(t, 10, creds.AppID)
+	assert.Equal(t, "fullsend-triage", creds.Slug)
+	assert.Equal(t, "Iv1.triage123", creds.ClientID)
+	assert.Empty(t, creds.PEM, "PEM should be empty to signal reuse")
+	assert.False(t, prompter.confirmCalled, "should not prompt for PEM recovery")
+	assert.False(t, prompter.readLineCalled, "should not ask for PEM file path")
+	assert.Contains(t, output.String(), "issues:write")
+	assert.Contains(t, output.String(), "/settings/installations/100")
+}
+
+func TestIsOrgOwned(t *testing.T) {
+	s := &Setup{}
+
+	t.Run("empty owner is treated as org-owned", func(t *testing.T) {
+		inst := &forge.Installation{AppOwnerLogin: ""}
+		assert.True(t, s.isOrgOwned(inst, "myorg"))
+	})
+
+	t.Run("matching owner is org-owned", func(t *testing.T) {
+		inst := &forge.Installation{AppOwnerLogin: "myorg"}
+		assert.True(t, s.isOrgOwned(inst, "myorg"))
+	})
+
+	t.Run("case-insensitive match", func(t *testing.T) {
+		inst := &forge.Installation{AppOwnerLogin: "MyOrg"}
+		assert.True(t, s.isOrgOwned(inst, "myorg"))
+	})
+
+	t.Run("different owner is third-party", func(t *testing.T) {
+		inst := &forge.Installation{AppOwnerLogin: "other-org"}
+		assert.False(t, s.isOrgOwned(inst, "myorg"))
+	})
+}
+
+func TestSetup_ExistingApp_ClientIDLookupFails(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-fullsend"},
+		},
+		// No AppClientIDs entry — GetAppClientID will return ErrNotFound.
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) {
+			return true, nil
+		})
+
+	_, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "client ID")
+}
+
+func TestSetup_KnownSlug_Match(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 200, AppID: 20, AppSlug: "custom-slug-name"},
+		},
+		AppClientIDs: map[string]string{
+			"custom-slug-name": "Iv1.custom123",
+		},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend").
+		WithKnownSlugs(map[string]string{"coder": "custom-slug-name"}).
+		WithSecretExists(func(_ string) (bool, error) {
+			return true, nil
+		})
+
+	creds, err := s.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	assert.Equal(t, 20, creds.AppID)
+	assert.Equal(t, "custom-slug-name", creds.Slug)
+	assert.Equal(t, "Iv1.custom123", creds.ClientID)
+	assert.Empty(t, creds.PEM)
+	assert.False(t, prompter.confirmCalled, "should not prompt for reuse")
+}
+
+// installOnOpenBrowser adds an installation to the FakeClient synchronously
+// inside Open() before returning, so that ensureInstalled's poll loop sees the
+// installation on its first check after the browser call — no goroutine needed.
+type installOnOpenBrowser struct {
+	client *forge.FakeClient
+	inst   forge.Installation
+	urlCh  chan string
+}
+
+func (b *installOnOpenBrowser) Open(_ context.Context, url string) error {
+	b.client.Installations = append(b.client.Installations, b.inst)
+	b.urlCh <- url
+	return nil
+}
+
+func TestSetup_PublicApp_NotInstalledYet_InstallsRatherThanCreates(t *testing.T) {
+	// App exists globally (public) but is not installed on the org yet.
+	// Expected: ensureInstalled is called (browser opens install URL), no manifest flow.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		AppClientIDs:  map[string]string{"fullsend-ai-coder": "Iv1.public123"},
+	}
+	prompter := &fakePrompter{}
+	browser := &installOnOpenBrowser{
+		client: client,
+		inst:   forge.Installation{ID: 1, AppID: 42, AppSlug: "fullsend-ai-coder"},
+		urlCh:  make(chan string, 1),
+	}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend-ai").
+		WithPublicApps(true)
+
+	creds, err := s.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	assert.Equal(t, "fullsend-ai-coder", creds.Slug)
+	assert.Equal(t, "Iv1.public123", creds.ClientID)
+	assert.Equal(t, 42, creds.AppID)
+	assert.Empty(t, creds.PEM, "no PEM expected for reused public app")
+	assert.False(t, prompter.confirmCalled, "should not prompt when --public is set")
+}
+
+func TestSetup_PublicApp_NotInstalledYet_FallsThroughToCreateWhenNotFound(t *testing.T) {
+	// publicApps=true but GetAppClientID fails (app doesn't exist) → manifest flow.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		// No AppClientIDs entry for "fullsend-ai-coder" → GetAppClientID returns error.
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend-ai").
+		WithPublicApps(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := s.Run(ctx, "myorg", "coder")
+	require.Error(t, err)
+	// Should have entered manifest flow (browser URL sent).
+	select {
+	case url := <-browser.urlCh:
+		assert.NotEmpty(t, url)
+	default:
+		t.Error("manifest flow should have opened browser")
+	}
+}
+
+func TestSetup_PublicApp_TransientErrorPropagated(t *testing.T) {
+	// publicApps=true and GetAppClientID returns a transient error (not ErrNotFound).
+	// Expected: error is propagated, NOT treated as "app doesn't exist".
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		Errors:        map[string]error{"GetAppClientID": fmt.Errorf("rate limit exceeded")},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend-ai").
+		WithPublicApps(true)
+
+	_, err := s.Run(context.Background(), "myorg", "coder")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checking existing app")
+	assert.Contains(t, err.Error(), "rate limit exceeded")
+}
+
+func TestSetup_PublicAppFound_WithoutFlag_UserConfirms(t *testing.T) {
+	// --public NOT set, but app exists globally. User confirms → installs it.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		AppClientIDs:  map[string]string{"fullsend-ai-coder": "Iv1.public123"},
+	}
+	prompter := &fakePrompter{confirmResult: true}
+	browser := &installOnOpenBrowser{
+		client: client,
+		inst:   forge.Installation{ID: 1, AppID: 42, AppSlug: "fullsend-ai-coder"},
+		urlCh:  make(chan string, 1),
+	}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend-ai")
+	// Note: WithPublicApps NOT called (defaults to false).
+
+	creds, err := s.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	assert.True(t, prompter.confirmCalled, "user should be prompted")
+	assert.Equal(t, "fullsend-ai-coder", creds.Slug)
+	assert.Equal(t, "Iv1.public123", creds.ClientID)
+	assert.Equal(t, 42, creds.AppID)
+	assert.Empty(t, creds.PEM)
+}
+
+func TestSetup_PublicAppFound_WithoutFlag_UserDeclines(t *testing.T) {
+	// --public NOT set, app exists globally. User says no → helpful error.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		AppClientIDs:  map[string]string{"fullsend-ai-coder": "Iv1.public123"},
+	}
+	prompter := &fakePrompter{confirmResult: false}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend-ai")
+
+	_, err := s.Run(context.Background(), "myorg", "coder")
+	require.Error(t, err)
+
+	assert.True(t, prompter.confirmCalled, "user should be prompted")
+	assert.Contains(t, err.Error(), "already exists")
+	assert.Contains(t, err.Error(), "--public")
+	assert.Contains(t, err.Error(), "--app-set")
+}
+
+func TestSetup_PublicAppFound_WithoutFlag_ConfirmError(t *testing.T) {
+	// --public NOT set, app exists globally, prompter returns error.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		AppClientIDs:  map[string]string{"fullsend-ai-coder": "Iv1.public123"},
+	}
+	prompter := &fakePrompter{confirmErr: fmt.Errorf("stdin closed")}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend-ai")
+
+	_, err := s.Run(context.Background(), "myorg", "coder")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "confirming app install")
+	assert.Contains(t, err.Error(), "stdin closed")
+}
+
+func TestSetup_RecoverCreatedApp_ResolvesAppID(t *testing.T) {
+	// recoverCreatedApp returns AppID=0. After ensureInstalled,
+	// findExistingInstallation should resolve the AppID.
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		AppClientIDs:  map[string]string{"fullsend-coder": "Iv1.coder456"},
+	}
+	browser := &installOnOpenBrowser{
+		client: client,
+		inst: forge.Installation{
+			ID: 1, AppID: 99, AppSlug: "fullsend-coder",
+			Permissions: map[string]string{"contents": "write"},
+		},
+		urlCh: make(chan string, 1),
+	}
+	var output bytes.Buffer
+	printer := ui.New(&output)
+
+	s := NewSetup(client, &fakePrompter{}, browser, printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	creds, err := s.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+	assert.Equal(t, 99, creds.AppID, "AppID should be resolved from installation")
+	assert.Equal(t, "fullsend-coder", creds.Slug)
+	assert.Equal(t, "Iv1.coder456", creds.ClientID)
+	assert.Contains(t, output.String(), "missing permissions")
+}
+
+func TestSetup_NoExistingApp(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+	}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer).
+		WithAppSet("fullsend")
+
+	// No existing app → manifest flow is started. Use a short context
+	// timeout so the test doesn't hang waiting for a GitHub callback.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := s.Run(ctx, "myorg", "fullsend")
+	require.Error(t, err)
+	// The error should come from the manifest flow (context deadline),
+	// not from the "existing app" checks.
+	assert.NotContains(t, err.Error(), "private key")
+	// Browser should have been asked to open a URL.
+	select {
+	case url := <-browser.urlCh:
+		assert.NotEmpty(t, url, "should have tried to open browser")
+	default:
+		t.Error("browser.Open was never called")
+	}
+}
+
+func TestManifestFlow_HTMLForm(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{},
+	}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, &fakePrompter{}, browser, printer).
+		WithAppSet("fullsend")
+
+	// Use a short timeout — we only need the server to start and serve the
+	// HTML page, not complete the full manifest flow.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Run the manifest flow in a goroutine; it will block waiting for the
+	// GitHub callback until the context expires.
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.Run(ctx, "testorg", "coder")
+		errCh <- err
+	}()
+
+	// Wait for the browser to receive the URL.
+	var formURL string
+	select {
+	case formURL = <-browser.urlCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for browser.Open to be called")
+	}
+
+	// Fetch the HTML page from the local server.
+	resp, err := http.Get(formURL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	html := string(body)
+
+	// 1. There must be exactly one hidden input named "manifest".
+	manifestInputRe := regexp.MustCompile(`<input[^>]+name="manifest"[^>]*>`)
+	manifestInputs := manifestInputRe.FindAllString(html, -1)
+	assert.Len(t, manifestInputs, 1, "expected exactly one hidden input named 'manifest'")
+
+	// 2. There must be NO hidden input named "redirect_url".
+	redirectInputRe := regexp.MustCompile(`<input[^>]+name="redirect_url"[^>]*>`)
+	redirectInputs := redirectInputRe.FindAllString(html, -1)
+	assert.Empty(t, redirectInputs, "there must be no hidden input named 'redirect_url'")
+
+	// 3. The manifest JSON must contain redirect_url matching the callback URL.
+	valueRe := regexp.MustCompile(`<input[^>]+name="manifest"[^>]+value="([^"]*)"`)
+	matches := valueRe.FindStringSubmatch(html)
+	require.Len(t, matches, 2, "could not extract manifest value from HTML")
+
+	// The value is HTML-escaped; decode it.
+	manifestJSON := strings.NewReplacer(
+		"&amp;", "&",
+		"&lt;", "<",
+		"&gt;", ">",
+		"&#34;", "\"",
+		"&#39;", "'",
+	).Replace(matches[1])
+
+	var manifest map[string]interface{}
+	err = json.Unmarshal([]byte(manifestJSON), &manifest)
+	require.NoError(t, err, "manifest value must be valid JSON")
+
+	redirectURL, ok := manifest["redirect_url"]
+	require.True(t, ok, "manifest JSON must contain redirect_url key")
+
+	// The callback URL should point to the local server's /callback path.
+	redirectStr, isString := redirectURL.(string)
+	require.True(t, isString, "redirect_url must be a string")
+	assert.True(t, strings.HasPrefix(redirectStr, "http://127.0.0.1:"),
+		"redirect_url should start with http://127.0.0.1:, got %s", redirectStr)
+	assert.True(t, strings.HasSuffix(redirectStr, "/callback"),
+		"redirect_url should end with /callback, got %s", redirectStr)
+
+	// Wait for the flow to finish (context timeout).
+	<-errCh
+}
+
+func TestSetup_APIBaseURL(t *testing.T) {
+	t.Run("returns the configured client base URL", func(t *testing.T) {
+		client := gh.New("").WithBaseURL("https://github.example.com/api/v3")
+		setup := NewSetup(client, nil, nil, nil)
+		assert.Equal(t, "https://github.example.com/api/v3", setup.apiBaseURL())
+	})
+
+	t.Run("empty when the client exposes no base URL", func(t *testing.T) {
+		setup := NewSetup(&forge.FakeClient{}, nil, nil, nil)
+		assert.Empty(t, setup.apiBaseURL())
+	})
+}
+
+func TestSetup_StalePermissions_EnterpriseHostGuidance(t *testing.T) {
+	// On a GitHub Enterprise host mintcore omits the public github.com URL and
+	// identifies the installation by org and ID instead.
+	client := gh.New("").WithBaseURL("https://github.example.com/api/v3")
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithAppSet("fullsend")
+
+	setup.checkPermissions(&forge.Installation{
+		ID:          42,
+		AppID:       10,
+		AppSlug:     "fullsend-fullsend",
+		Permissions: map[string]string{"contents": "read"},
+	}, "myorg", "fullsend")
+
+	require.Error(t, setup.PermissionErrors())
+	warning := output.String()
+	assert.Contains(t, warning, "installation_id=42")
+	assert.Contains(t, warning, `org="myorg"`)
+	assert.NotContains(t, warning, "https://github.com/",
+		"enterprise guidance must not link to public github.com")
+}
+
+func TestSetup_StalePermissions_AllRolesChecked(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.abc",
+			"fullsend-triage":   "Iv1.def",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 100, AppID: 10, AppSlug: "fullsend-fullsend",
+				Permissions: map[string]string{
+					"contents":       "write",
+					"issues":         "read",
+					"pull_requests":  "write",
+					"checks":         "read",
+					"administration": "write",
+					"members":        "read",
+					// missing: workflows
+				},
+			},
+			{
+				ID: 101, AppID: 11, AppSlug: "fullsend-triage",
+				Permissions: map[string]string{
+					// has issues:read but needs issues:write
+					"issues": "read",
+				},
+			},
+		},
+	}
+	var output bytes.Buffer
+	printer := ui.New(&output)
+
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	// Run both roles — each should succeed individually.
+	_, err := setup.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+	_, err = setup.Run(context.Background(), "myorg", "triage")
+	require.NoError(t, err)
+
+	// None of the missing permissions are optional rollout permissions, so
+	// setup still fails the way it did before the rollout mechanism existed.
+	err = setup.PermissionErrors()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fullsend-fullsend")
+	assert.Contains(t, err.Error(), "fullsend-triage")
+	assert.Contains(t, output.String(), "fullsend-fullsend")
+	assert.Contains(t, output.String(), "fullsend-triage")
+}
+
+func TestSetup_StalePermissions_IncludesInstallationURL(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.abc",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 12345, AppID: 10, AppSlug: "fullsend-fullsend",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"issues":        "read",
+					"pull_requests": "write",
+					"checks":        "read",
+					// missing some expected permissions
+				},
+			},
+		},
+	}
+	var output bytes.Buffer
+	printer := ui.New(&output)
+
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+
+	permErr := setup.PermissionErrors()
+	require.Error(t, permErr)
+	assert.NotContains(t, permErr.Error(), "/settings/apps/fullsend-fullsend/permissions",
+		"error should not include a direct link to the App owner's settings page")
+	assert.Contains(t, permErr.Error(), "/settings/installations/12345",
+		"error should contain the installation approval URL")
+	assert.Contains(t, permErr.Error(), "organizations/myorg",
+		"installation URL should reference the correct org")
+
+	warning := output.String()
+	assert.NotContains(t, warning, "/settings/apps/fullsend-fullsend/permissions",
+		"warning should not include a direct link to the App owner's settings page")
+	assert.Contains(t, warning, "/settings/installations/12345",
+		"warning should contain the installation approval URL")
+	assert.Contains(t, warning, "organizations/myorg",
+		"installation URL should reference the correct org")
+	assert.Contains(t, warning, "App owner must add them",
+		"warning should cover the case where the App registration has not been updated")
+}
+
+func TestSetup_PendingCoderPackagesPermissionIsWarningOnly(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"issues":        "write",
+					"pull_requests": "write",
+					"checks":        "read",
+					// packages:read is pending installation approval.
+				},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+	assert.NoError(t, setup.PermissionErrors())
+	assert.Contains(t, output.String(), "packages:read")
+	assert.Contains(t, output.String(), "/settings/installations/4242")
+}
+
+func TestSetup_EmptyPermissionsMapSkipsCheck(t *testing.T) {
+	// A non-nil but empty permissions object carries no grant data (GitHub
+	// always grants at least metadata:read), so the check must be skipped
+	// rather than reporting every permission as missing.
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+	assert.NoError(t, setup.PermissionErrors())
+	assert.Contains(t, output.String(), "permissions not available")
+}
+
+func TestSetup_MissingRequiredPermissionFailsSetup(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"packages":      "read",
+					"pull_requests": "write",
+					"checks":        "read",
+					// issues:write is missing and is not an optional rollout
+					// permission, so setup must fail.
+				},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	permErr := setup.PermissionErrors()
+	require.Error(t, permErr)
+	assert.Contains(t, permErr.Error(), "issues:write")
+	assert.Contains(t, permErr.Error(), "fullsend-ai-coder")
+	assert.NotContains(t, permErr.Error(), "packages",
+		"a granted optional permission must not appear in the error")
+}
+
+func TestSetup_MixedOptionalAndRequiredMissing(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"pull_requests": "write",
+					"checks":        "read",
+					// missing: packages:read (optional) and issues:write
+					// (required).
+				},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	permErr := setup.PermissionErrors()
+	require.Error(t, permErr)
+	assert.Contains(t, permErr.Error(), "issues:write")
+	assert.NotContains(t, permErr.Error(), "packages:read",
+		"an optional rollout permission must stay out of the setup error")
+	assert.Contains(t, output.String(), "packages:read",
+		"the optional permission is still surfaced as a warning")
+}
+
+func TestSetup_CorrectPermissions_NoError(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.abc",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 100, AppID: 10, AppSlug: "fullsend-fullsend",
+				Permissions: map[string]string{
+					"actions":               "write",
+					"contents":              "write",
+					"actions_variables":     "read",
+					"workflows":             "write",
+					"issues":                "read",
+					"pull_requests":         "write",
+					"checks":                "read",
+					"administration":        "write",
+					"members":               "read",
+					"organization_projects": "read",
+				},
+			},
+		},
+	}
+	var output bytes.Buffer
+	printer := ui.New(&output)
+
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+
+	assert.NoError(t, setup.PermissionErrors())
+	assert.NotContains(t, output.String(), "missing")
+}
+
+func TestSetup_DefaultAppSet(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-ai-coder"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.default123",
+		},
+	}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	creds, err := s.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+	assert.Equal(t, "fullsend-ai-coder", creds.Slug)
+	assert.Equal(t, "Iv1.default123", creds.ClientID)
+}
+
+// --- PEM recovery tests ---
+
+func generateTestPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+}
+
+func writeTempPEM(t *testing.T, data []byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test-key.pem")
+	require.NoError(t, os.WriteFile(path, data, 0600))
+	return path
+}
+
+func existingAppSetup(t *testing.T, prompter *fakePrompter) (*Setup, *forge.FakeClient) {
+	t.Helper()
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-triage": "Iv1.triage123",
+		},
+	}
+	printer := ui.New(&discardWriter{})
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return false, nil })
+	return s, client
+}
+
+func TestSetup_ExistingApp_PEMRecovery_HappyPath(t *testing.T) {
+	pemData := generateTestPEM(t)
+	pemPath := writeTempPEM(t, pemData)
+
+	prompter := &fakePrompter{confirmResult: true, readLineResult: pemPath}
+	var storedRole, storedPEM string
+	s, _ := existingAppSetup(t, prompter)
+	s = s.WithStoreSecret(func(_ context.Context, role, p string) error {
+		storedRole = role
+		storedPEM = p
+		return nil
+	})
+
+	creds, err := s.Run(context.Background(), "myorg", "triage")
+	require.NoError(t, err)
+	assert.Equal(t, 10, creds.AppID)
+	assert.Equal(t, "fullsend-triage", creds.Slug)
+	assert.Equal(t, "Iv1.triage123", creds.ClientID)
+	assert.NotEmpty(t, creds.PEM)
+	assert.Equal(t, "triage", storedRole)
+	assert.NotEmpty(t, storedPEM)
+	assert.True(t, prompter.confirmCalled)
+	assert.True(t, prompter.readLineCalled)
+}
+
+func TestSetup_ExistingApp_PEMRecovery_UserDeclines(t *testing.T) {
+	prompter := &fakePrompter{confirmResult: false}
+	s, _ := existingAppSetup(t, prompter)
+
+	_, err := s.Run(context.Background(), "myorg", "triage")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "private key secret is missing")
+	assert.True(t, prompter.confirmCalled)
+	assert.False(t, prompter.readLineCalled)
+}
+
+func TestSetup_ExistingApp_PEMRecovery_InvalidPEM(t *testing.T) {
+	badPath := writeTempPEM(t, []byte("not a valid pem"))
+	prompter := &fakePrompter{confirmResult: true, readLineResult: badPath}
+	s, _ := existingAppSetup(t, prompter)
+
+	_, err := s.Run(context.Background(), "myorg", "triage")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid PEM file")
+}
+
+func TestSetup_ExistingApp_PEMRecovery_FileNotFound(t *testing.T) {
+	prompter := &fakePrompter{confirmResult: true, readLineResult: "/nonexistent/path.pem"}
+	s, _ := existingAppSetup(t, prompter)
+
+	_, err := s.Run(context.Background(), "myorg", "triage")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checking PEM file")
+}
+
+func TestSetup_ExistingApp_StaleAppID_TriggersRecovery(t *testing.T) {
+	pemData := generateTestPEM(t)
+	pemPath := writeTempPEM(t, pemData)
+
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 20, AppSlug: "fullsend-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.fullsend123",
+		},
+	}
+	prompter := &fakePrompter{confirmResult: true, readLineResult: pemPath}
+	printer := ui.New(&discardWriter{})
+
+	var storedPEM string
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil }).
+		WithStoredAppIDs(map[string]string{"fullsend": "10"}).
+		WithStoreSecret(func(_ context.Context, _, p string) error {
+			storedPEM = p
+			return nil
+		})
+
+	creds, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+	assert.Equal(t, 20, creds.AppID)
+	assert.NotEmpty(t, creds.PEM, "should have new PEM from recovery")
+	assert.NotEmpty(t, storedPEM, "should have stored new PEM")
+	assert.True(t, prompter.confirmCalled, "should prompt for PEM recovery")
+}
+
+func TestSetup_ExistingApp_MatchingAppID_Reuses(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.fullsend123",
+		},
+	}
+	prompter := &fakePrompter{}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil }).
+		WithStoredAppIDs(map[string]string{"fullsend": "10"})
+
+	creds, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+	assert.Equal(t, 10, creds.AppID)
+	assert.Empty(t, creds.PEM, "PEM should be empty to signal reuse")
+	assert.False(t, prompter.confirmCalled, "should not prompt — IDs match")
+}
+
+func TestSetup_ExistingApp_NoStoredIDs_Reuses(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 10, AppSlug: "fullsend-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.fullsend123",
+		},
+	}
+	prompter := &fakePrompter{}
+	printer := ui.New(&discardWriter{})
+
+	// No WithStoredAppIDs — backwards compatible behavior.
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	creds, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.NoError(t, err)
+	assert.Equal(t, 10, creds.AppID)
+	assert.Empty(t, creds.PEM, "PEM should be empty to signal reuse")
+	assert.False(t, prompter.confirmCalled, "should not prompt — no stored IDs to compare")
+}
+
+func TestIsAppIDStale(t *testing.T) {
+	s := &Setup{}
+
+	t.Run("nil map returns false", func(t *testing.T) {
+		assert.False(t, s.isAppIDStale("org", "role", 10))
+	})
+
+	s.storedAppIDs = map[string]string{
+		"fullsend":   "10",
+		"prioritize": "20",
+	}
+
+	t.Run("matching ID returns false", func(t *testing.T) {
+		assert.False(t, s.isAppIDStale("myorg", "fullsend", 10))
+	})
+
+	t.Run("mismatched ID returns true", func(t *testing.T) {
+		assert.True(t, s.isAppIDStale("myorg", "fullsend", 99))
+	})
+
+	t.Run("unknown key returns false", func(t *testing.T) {
+		assert.False(t, s.isAppIDStale("otherog", "fullsend", 10))
+	})
+}
+
+func TestSetup_ExistingApp_StaleAppID_UserDeclines(t *testing.T) {
+	client := &forge.FakeClient{
+		Installations: []forge.Installation{
+			{ID: 100, AppID: 20, AppSlug: "fullsend-fullsend"},
+		},
+		AppClientIDs: map[string]string{
+			"fullsend-fullsend": "Iv1.fullsend123",
+		},
+	}
+	prompter := &fakePrompter{confirmResult: false}
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, newFakeBrowser(), printer).
+		WithAppSet("fullsend").
+		WithSecretExists(func(_ string) (bool, error) { return true, nil }).
+		WithStoredAppIDs(map[string]string{"fullsend": "10"})
+
+	_, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "was recreated")
+	assert.True(t, prompter.confirmCalled, "should prompt for PEM recovery")
+	assert.False(t, prompter.readLineCalled, "should not ask for file path after decline")
+}
+
+func TestValidateRSAPEM_Valid(t *testing.T) {
+	assert.NoError(t, ValidateRSAPEM(generateTestPEM(t)))
+}
+
+func TestValidateRSAPEM_InvalidBlock(t *testing.T) {
+	assert.Error(t, ValidateRSAPEM([]byte("garbage data")))
+}
+
+func TestValidateRSAPEM_NonRSAKey(t *testing.T) {
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(ecKey)
+	require.NoError(t, err)
+	ecPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	err = ValidateRSAPEM(ecPEM)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected RSA")
+}
+
+// nonGitHubClient wraps a forge.Client without implementing
+// forge.GitHubExtensions, so type assertions to that interface fail.
+type nonGitHubClient struct {
+	forge.Client
+}
+
+func TestSetup_Run_NonGitHub_ReturnsErrNotSupported(t *testing.T) {
+	client := &nonGitHubClient{Client: forge.NewFakeClient()}
+	prompter := &fakePrompter{}
+	browser := newFakeBrowser()
+	printer := ui.New(&discardWriter{})
+
+	s := NewSetup(client, prompter, browser, printer)
+	_, err := s.Run(context.Background(), "myorg", "fullsend")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "app setup requires GitHub")
+	assert.True(t, forge.IsNotSupported(err))
+}
+
+func TestSetup_RecoverCreatedApp_NonGitHub_ReturnsNil(t *testing.T) {
+	client := &nonGitHubClient{Client: forge.NewFakeClient()}
+	printer := ui.New(&discardWriter{})
+
+	s := &Setup{
+		client:       client,
+		ui:           printer,
+		secretExists: func(string) (bool, error) { return true, nil },
+	}
+	creds, err := s.recoverCreatedApp(context.Background(), "myorg", "fullsend", "fullsend-ai-fullsend")
+	require.NoError(t, err)
+	assert.Nil(t, creds)
+}
+
+func TestSetup_HandleExistingApp_NonGitHub_ReturnsError(t *testing.T) {
+	client := &nonGitHubClient{Client: forge.NewFakeClient()}
+	printer := ui.New(&discardWriter{})
+
+	s := &Setup{
+		client: client,
+		ui:     printer,
+	}
+	inst := &forge.Installation{AppSlug: "test-app", AppID: 42}
+	_, err := s.handleExistingApp(context.Background(), inst, "myorg", "fullsend")
+	require.Error(t, err)
+	assert.True(t, forge.IsNotSupported(err))
+	assert.Contains(t, err.Error(), "looking up client ID")
+}
+
+func TestSetup_EnsureInstalled_NonGitHub_ReturnsError(t *testing.T) {
+	client := &nonGitHubClient{Client: forge.NewFakeClient()}
+	printer := ui.New(&discardWriter{})
+
+	s := &Setup{
+		client: client,
+		ui:     printer,
+	}
+	err := s.ensureInstalled(context.Background(), "myorg", "test-app")
+	require.Error(t, err)
+	assert.True(t, forge.IsNotSupported(err))
+}
+
+func TestSetup_FindExistingInstallation_NonGitHub_ReturnsNil(t *testing.T) {
+	client := &nonGitHubClient{Client: forge.NewFakeClient()}
+	printer := ui.New(&discardWriter{})
+
+	s := &Setup{
+		client: client,
+		ui:     printer,
+	}
+	inst, found, err := s.findExistingInstallation(context.Background(), "myorg", "fullsend", "fullsend-ai-fullsend")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Nil(t, inst)
+}
+
+// delayedReadyClient wraps a FakeClient but makes GetAppClientID return
+// ErrNotFound for the first readyAfter calls, simulating the delay GitHub
+// has when provisioning a newly created app.
+type delayedReadyClient struct {
+	*forge.FakeClient
+	readyAfter int
+	mu         sync.Mutex
+	callCount  int
+}
+
+func (d *delayedReadyClient) GetAppClientID(ctx context.Context, slug string) (string, error) {
+	d.mu.Lock()
+	d.callCount++
+	count := d.callCount
+	d.mu.Unlock()
+	if count <= d.readyAfter {
+		return "", fmt.Errorf("%w: app %s", forge.ErrNotFound, slug)
+	}
+	return d.FakeClient.GetAppClientID(ctx, slug)
+}
+
+func TestWaitForAppReady_ImmediatelyAvailable(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{"test-app": "Iv1.test123"},
+	}
+	printer := ui.New(&discardWriter{})
+	s := &Setup{client: client, ui: printer}
+
+	err := s.waitForAppReady(context.Background(), client, "test-app")
+	assert.NoError(t, err)
+}
+
+func TestWaitForAppReady_BecomesAvailableAfterRetries(t *testing.T) {
+	innerClient := &forge.FakeClient{
+		AppClientIDs: map[string]string{"test-app": "Iv1.test123"},
+	}
+	client := &delayedReadyClient{
+		FakeClient: innerClient,
+		readyAfter: 2, // first 2 calls return not-found, 3rd succeeds
+	}
+	printer := ui.New(&discardWriter{})
+	s := &Setup{client: client, ui: printer}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := s.waitForAppReady(ctx, client, "test-app")
+	assert.NoError(t, err)
+
+	client.mu.Lock()
+	calls := client.callCount
+	client.mu.Unlock()
+	assert.Equal(t, 3, calls, "expected 3 GetAppClientID calls: 1 quick check + 2 polls")
+}
+
+func TestWaitForAppReady_Timeout(t *testing.T) {
+	client := &forge.FakeClient{
+		// No AppClientIDs — GetAppClientID always returns ErrNotFound.
+	}
+	printer := ui.New(&discardWriter{})
+	s := &Setup{client: client, ui: printer, readinessTimeout: 200 * time.Millisecond}
+
+	err := s.waitForAppReady(context.Background(), client, "nonexistent-app")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out waiting for app nonexistent-app")
+}
+
+func TestEnsureInstalled_WaitsForAppReady(t *testing.T) {
+	// Simulate an app that takes a couple of polls to become available,
+	// then gets installed when the browser opens.
+	innerClient := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		AppClientIDs:  map[string]string{"test-app": "Iv1.test123"},
+	}
+	client := &delayedReadyClient{
+		FakeClient: innerClient,
+		readyAfter: 1, // first call returns not-found, second succeeds
+	}
+	browser := &installOnOpenBrowser{
+		client: innerClient,
+		inst:   forge.Installation{ID: 1, AppID: 42, AppSlug: "test-app"},
+		urlCh:  make(chan string, 1),
+	}
+	printer := ui.New(&discardWriter{})
+	s := &Setup{client: client, browser: browser, ui: printer}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := s.ensureInstalled(ctx, "myorg", "test-app")
+	require.NoError(t, err)
+
+	// Verify the browser was opened with the install URL.
+	select {
+	case url := <-browser.urlCh:
+		assert.Contains(t, url, "/apps/test-app/installations/new")
+	default:
+		t.Error("browser.Open was never called")
+	}
+
+	// Verify GetAppClientID was called more than once (readiness poll happened).
+	client.mu.Lock()
+	calls := client.callCount
+	client.mu.Unlock()
+	assert.GreaterOrEqual(t, calls, 2, "expected at least 2 GetAppClientID calls for readiness check")
+}
+
+func TestEnsureInstalled_ProceedsWhenReadinessTimesOut(t *testing.T) {
+	// When the readiness check times out, ensureInstalled should still
+	// open the browser and proceed with the installation poll.
+	innerClient := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		// No AppClientIDs — GetAppClientID always returns ErrNotFound,
+		// so waitForAppReady will time out.
+	}
+	browser := &installOnOpenBrowser{
+		client: innerClient,
+		inst:   forge.Installation{ID: 1, AppID: 42, AppSlug: "test-app"},
+		urlCh:  make(chan string, 1),
+	}
+	var output bytes.Buffer
+	printer := ui.New(&output)
+	s := &Setup{
+		client:           innerClient,
+		browser:          browser,
+		ui:               printer,
+		readinessTimeout: 200 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := s.ensureInstalled(ctx, "myorg", "test-app")
+	require.NoError(t, err)
+
+	// Verify the browser was opened despite the readiness timeout.
+	select {
+	case url := <-browser.urlCh:
+		assert.Contains(t, url, "/apps/test-app/installations/new")
+	default:
+		t.Error("browser.Open should be called even when readiness check times out")
+	}
+
+	// Verify the warning about readiness timeout was printed.
+	assert.Contains(t, output.String(), "readiness check failed")
+}
+
+func TestEnsureInstalled_ReturnsEarlyOnContextCancel(t *testing.T) {
+	// When the parent context is cancelled, ensureInstalled should return
+	// the context error immediately instead of opening the browser.
+	innerClient := &forge.FakeClient{
+		Installations: []forge.Installation{},
+		// No AppClientIDs — GetAppClientID always returns ErrNotFound,
+		// so waitForAppReady will keep polling until the context is cancelled.
+	}
+	browser := &installOnOpenBrowser{
+		client: innerClient,
+		inst:   forge.Installation{ID: 1, AppID: 42, AppSlug: "test-app"},
+		urlCh:  make(chan string, 1),
+	}
+	printer := ui.New(&discardWriter{})
+	s := &Setup{
+		client:           innerClient,
+		browser:          browser,
+		ui:               printer,
+		readinessTimeout: 5 * time.Second,
+	}
+
+	// Cancel the context immediately so waitForAppReady exits via
+	// the parent context rather than its own readiness timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := s.ensureInstalled(ctx, "myorg", "test-app")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	// Verify the browser was NOT opened.
+	select {
+	case <-browser.urlCh:
+		t.Error("browser.Open should not be called when context is cancelled")
+	default:
+		// expected — no browser opened
+	}
+}
+
+// discardWriter implements io.Writer, discarding all output.
+type discardWriter struct{}
+
+func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }

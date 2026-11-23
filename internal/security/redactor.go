@@ -1,0 +1,269 @@
+package security
+
+import (
+	"cmp"
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+)
+
+// Runtime secrets are exact credential values the runner learned during
+// this process — an access token it exchanged, for example — that no
+// prefix or structural pattern can be trusted to match (the OpenAI WIF
+// token is contractually opaque, #6689). Scan masks them before any
+// pattern runs. Values shorter than minRuntimeSecretLen are ignored so a
+// trivial string can never blank out ordinary output.
+const minRuntimeSecretLen = 8
+
+var (
+	runtimeSecretsMu sync.RWMutex
+	runtimeSecrets   []string
+)
+
+// RegisterRuntimeSecret adds an exact value to the process-wide redaction
+// set and reports whether it is now registered. Registering the same value
+// twice is a no-op; a value below the minimum length is refused (false) so
+// the caller can decide not to use a credential it cannot redact.
+func RegisterRuntimeSecret(value string) bool {
+	if len(value) < minRuntimeSecretLen {
+		return false
+	}
+	runtimeSecretsMu.Lock()
+	defer runtimeSecretsMu.Unlock()
+	for _, v := range runtimeSecrets {
+		if v == value {
+			return true
+		}
+	}
+	runtimeSecrets = append(runtimeSecrets, value)
+	return true
+}
+
+// runtimeSecretSnapshot returns the registered values, longest first, so
+// a value that is a substring of another never breaks the longer match.
+func runtimeSecretSnapshot() []string {
+	runtimeSecretsMu.RLock()
+	snapshot := append([]string(nil), runtimeSecrets...)
+	runtimeSecretsMu.RUnlock()
+	slices.SortStableFunc(snapshot, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+	return snapshot
+}
+
+// RuntimeSecrets returns the registered runtime secrets, longest first,
+// for callers that combine them with their own literals in one
+// longest-first pass.
+func RuntimeSecrets() []string { return runtimeSecretSnapshot() }
+
+// resetRuntimeSecrets clears the registry; tests only.
+func resetRuntimeSecrets() {
+	runtimeSecretsMu.Lock()
+	defer runtimeSecretsMu.Unlock()
+	runtimeSecrets = nil
+}
+
+// SecretRedactor scans text for API keys, tokens, credentials, and
+// sensitive patterns, replacing them with masked versions. Adapted from
+// Hermes Agent's agent/redact.py.
+type SecretRedactor struct {
+	prefixPatterns     []secretPattern
+	structuralPatterns []secretPattern
+}
+
+type secretPattern struct {
+	name  string
+	regex *regexp.Regexp
+}
+
+// NewSecretRedactor creates a redactor with the default pattern set.
+func NewSecretRedactor() *SecretRedactor {
+	return &SecretRedactor{
+		prefixPatterns:     defaultPrefixPatterns(),
+		structuralPatterns: defaultStructuralPatterns(),
+	}
+}
+
+func (s *SecretRedactor) Name() string { return "secret_redactor" }
+
+func (s *SecretRedactor) Scan(text string) ScanResult {
+	result := ScanResult{Safe: true, Sanitized: text}
+	current := text
+
+	// Exact runtime values first: they are the highest-confidence match
+	// and must not be partially consumed by a looser pattern.
+	for _, secret := range runtimeSecretSnapshot() {
+		if !strings.Contains(current, secret) {
+			continue
+		}
+		// No prefix is informative for an opaque value, so mask it whole.
+		const masked = "***"
+		result.Findings = append(result.Findings, Finding{
+			Scanner:  "secret_redactor",
+			Name:     "runtime_secret",
+			Severity: "critical",
+			Detail:   "Redacted runtime_secret -> " + masked,
+		})
+		current = strings.ReplaceAll(current, secret, masked)
+		result.Safe = false
+	}
+
+	// Prefix-based patterns (full match is the secret).
+	// Use ReplaceAll to catch duplicate occurrences of the same secret.
+	for _, p := range s.prefixPatterns {
+		// Deduplicate matches so we report each unique secret once.
+		seen := map[string]bool{}
+		matches := p.regex.FindAllString(current, -1)
+		for _, match := range matches {
+			if seen[match] {
+				continue
+			}
+			seen[match] = true
+			masked := mask(match)
+			result.Findings = append(result.Findings, Finding{
+				Scanner:  "secret_redactor",
+				Name:     p.name,
+				Severity: "critical",
+				Detail:   fmt.Sprintf("Redacted %s (%d chars) -> %s", p.name, len(match), masked),
+			})
+			current = strings.ReplaceAll(current, match, masked)
+			result.Safe = false
+		}
+	}
+
+	// Structural patterns (capture group is the secret)
+	for _, p := range s.structuralPatterns {
+		// Private key: replace full match (no capture group needed).
+		if p.name == "private_key" {
+			matches := p.regex.FindAllString(current, -1)
+			for _, match := range matches {
+				result.Findings = append(result.Findings, Finding{
+					Scanner:  "secret_redactor",
+					Name:     p.name,
+					Severity: "critical",
+					Detail:   "Private key block detected and redacted",
+				})
+				current = strings.ReplaceAll(current, match, "[REDACTED PRIVATE KEY]")
+				result.Safe = false
+			}
+			continue
+		}
+
+		// Other structural patterns: process matches in reverse order so
+		// byte offsets remain valid as we replace substrings.
+		locs := p.regex.FindAllStringSubmatchIndex(current, -1)
+		for i := len(locs) - 1; i >= 0; i-- {
+			loc := locs[i]
+			// Use last non-negative capture group as the secret value.
+			// FindAllStringSubmatchIndex returns pairs: [full_start, full_end, group1_start, group1_end, ...]
+			nGroups := len(loc)/2 - 1
+			if nGroups < 1 {
+				continue
+			}
+			start, end := -1, -1
+			for g := nGroups; g >= 1; g-- {
+				if loc[g*2] >= 0 && loc[g*2+1] >= 0 {
+					start = loc[g*2]
+					end = loc[g*2+1]
+					break
+				}
+			}
+			if start < 0 || end < 0 {
+				continue
+			}
+
+			secret := current[start:end]
+			masked := mask(secret)
+			result.Findings = append(result.Findings, Finding{
+				Scanner:  "secret_redactor",
+				Name:     p.name,
+				Severity: "high",
+				Detail:   fmt.Sprintf("Redacted %s (%d chars) -> %s", p.name, len(secret), masked),
+			})
+			current = current[:start] + masked + current[end:]
+			result.Safe = false
+		}
+	}
+
+	if current != text {
+		result.Sanitized = current
+	} else {
+		result.Sanitized = ""
+	}
+
+	return result
+}
+
+func mask(value string) string {
+	if len(value) < 10 {
+		return "***"
+	}
+	return value[:4] + "..."
+}
+
+func defaultPrefixPatterns() []secretPattern {
+	patterns := []struct {
+		name    string
+		pattern string
+	}{
+		// Longer prefixes first to match before shorter ones
+		{"openai_proj", `sk-proj-[a-zA-Z0-9_-]{20,}`},
+		{"anthropic_key", `sk-ant-[a-zA-Z0-9_-]{20,}`},
+		{"openai_key", `sk-[a-zA-Z0-9_-]{20,}`},
+		{"github_fine_pat", `github_pat_[a-zA-Z0-9_]{22,}`},
+		{"github_pat", `ghp_[a-zA-Z0-9_]{36,}`},
+		{"github_oauth", `gho_[a-zA-Z0-9_]{36,}`},
+		{"github_user_token", `ghu_[a-zA-Z0-9_]{36,}`},
+		{"github_server_token", `ghs_[a-zA-Z0-9_.\-]{36,}`},
+		{"github_refresh_token", `ghr_[a-zA-Z0-9_]{36,}`},
+		{"slack_token", `xox[baprs]-[a-zA-Z0-9-]{10,}`},
+		{"google_api_key", `AIza[a-zA-Z0-9_-]{35}`},
+		// Google OAuth access tokens: an optional one- or two-letter type
+		// segment (c. service account; dr. for the workforce STS response
+		// Google documents) would otherwise defeat the {20,} quantifier.
+		{"google_oauth_token", `ya29\.(?:[a-z]{1,2}\.)?[a-zA-Z0-9_\-]{20,}`},
+		{"aws_access_key", `AKIA[A-Z0-9]{16}`},
+		{"stripe_live", `sk_live_[a-zA-Z0-9]{24,}`},
+		{"stripe_test", `sk_test_[a-zA-Z0-9]{24,}`},
+		{"sendgrid_key", `SG\.[a-zA-Z0-9_-]{22,}\.[a-zA-Z0-9_-]{20,}`},
+		{"hf_token", `hf_[a-zA-Z0-9]{34,}`},
+		{"npm_token", `npm_[a-zA-Z0-9]{36,}`},
+		{"pypi_token", `pypi-[a-zA-Z0-9_-]{50,}`},
+		{"gitlab_pat", `glpat-[a-zA-Z0-9_-]{20,}`},
+		{"vault_token", `hvs\.[a-zA-Z0-9_-]{24,}`},
+		{"age_secret_key", `AGE-SECRET-KEY-[A-Z0-9]{59}`},
+		// Bare three-segment JWTs (and OIDC/WIF STS tokens) carry no
+		// surrounding context for the structural patterns to anchor on.
+		{"jwt", `eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}`},
+	}
+
+	result := make([]secretPattern, len(patterns))
+	for i, p := range patterns {
+		result[i] = secretPattern{name: p.name, regex: regexp.MustCompile(p.pattern)}
+	}
+	return result
+}
+
+func defaultStructuralPatterns() []secretPattern {
+	patterns := []struct {
+		name    string
+		pattern string
+	}{
+		// An auth scheme word (basic/bearer/token) may follow an opening
+		// quote — TOKEN="basic <base64>" — and stays outside the capture so
+		// the mask keeps it visible. A bare value still ends at the first
+		// space, as in the PostToolUse hook.
+		{"env_assignment", `(?i)(?:^|\s)(?:export\s+)?((?:[A-Za-z0-9]+_)*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD|AUTH|API_KEY)(?:_[A-Za-z0-9]+)*)\s*=\s*(?:['"](?:(?:basic|bearer|token)[ \t]+)?)?([^\s"'}\]),;]{8,})['"]?`},
+		{"json_field", `(?:"[^"]*(?i:key|token|secret|password|credential|auth)[^"]*"|'[^']*(?i:key|token|secret|password|credential|auth)[^']*')\s*:\s*(?:"([^"]{8,})"|'([^']{8,})')`},
+		// The optional quote covers YAML: authorization: "Bearer <token>".
+		{"auth_header", `(?i)(?:Authorization|X-Api-Key|X-Auth-Token)\s*:\s*['"]?(?:(?:Basic|Bearer|Token)\s+)?([^\s"'}\]),;]{12,})`},
+		{"private_key", `-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----`},
+		{"db_connection_password", `(?:postgres(?:ql)?|mysql|mongodb|redis)://[^:]+:([^\s"'}\]),;]{4,})@[^@\s/]+`},
+	}
+
+	result := make([]secretPattern, len(patterns))
+	for i, p := range patterns {
+		result[i] = secretPattern{name: p.name, regex: regexp.MustCompile("(?m)" + p.pattern)}
+	}
+	return result
+}
