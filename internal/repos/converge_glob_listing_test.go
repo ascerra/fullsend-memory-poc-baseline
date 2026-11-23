@@ -55,20 +55,26 @@ func TestReconcileGlobSelection_ReportsNewRepos(t *testing.T) {
 
 	t.Run("no filter", func(t *testing.T) {
 		progress := &progressLog{}
-		kept := reconcileGlobSelection(ctx, m, live, preflight, nil, selected, progress.fn)
+		kept, dropped, err := reconcileGlobSelection(ctx, m, live, preflight, nil, selected, progress.fn)
+		require.NoError(t, err)
 		assert.Equal(t, selected, kept)
+		assert.Empty(t, dropped)
 		assert.Equal(t, []string{"acme/docs " + notice, "acme/web " + notice}, progress.all())
 	})
 	t.Run("filter", func(t *testing.T) {
 		progress := &progressLog{}
-		kept := reconcileGlobSelection(ctx, m, live, preflight, []string{"acme/api", "ACME/w*"}, selected, progress.fn)
+		kept, dropped, err := reconcileGlobSelection(ctx, m, live, preflight, []string{"acme/api", "ACME/w*"}, selected, progress.fn)
+		require.NoError(t, err)
 		assert.Equal(t, selected, kept)
+		assert.Empty(t, dropped)
 		assert.Equal(t, []string{"acme/web " + notice}, progress.all())
 	})
 	t.Run("nothing new", func(t *testing.T) {
 		progress := &progressLog{}
-		kept := reconcileGlobSelection(ctx, m, newTestClientFactory(acmeListing("api")), preflight, nil, selected, progress.fn)
+		kept, dropped, err := reconcileGlobSelection(ctx, m, newTestClientFactory(acmeListing("api")), preflight, nil, selected, progress.fn)
+		require.NoError(t, err)
 		assert.Equal(t, selected, kept)
+		assert.Empty(t, dropped)
 		assert.Empty(t, progress.all())
 	})
 }
@@ -91,16 +97,58 @@ func TestReconcileGlobSelection_DropsReposNoLongerListed(t *testing.T) {
 	live.Repos[1].Archived = true
 
 	progress := &progressLog{}
-	kept := reconcileGlobSelection(ctx, m, newTestClientFactory(live), preflight, nil, selected, progress.fn)
-	var names []string
-	for _, rr := range kept {
-		names = append(names, rr.Owner+"/"+rr.Repo)
-	}
-	assert.Equal(t, []string{"acme/api", "acme/forked"}, names)
+	kept, dropped, err := reconcileGlobSelection(ctx, m, newTestClientFactory(live), preflight, nil, selected, progress.fn)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"acme/api", "acme/forked"}, repoNames(kept))
+	assert.Equal(t, []string{"acme/docs", "acme/web"}, repoNames(dropped))
 	assert.Equal(t, []string{"acme/docs " + gone, "acme/web " + gone}, progress.all())
 }
 
-// A live listing that fails is reported and leaves the selection as it is.
+func repoNames(rrs []ResolvedRepo) []string {
+	var names []string
+	for _, rr := range rrs {
+		names = append(names, rr.Owner+"/"+rr.Repo)
+	}
+	return names
+}
+
+// Org names are compared case-insensitively: an explicit entry whose owner
+// is spelled differently from the glob's org, or a glob whose org is spelled
+// differently from the explicit entry, is still checked against the listing
+// that glob read, and dropped when the live listing no longer shows it.
+func TestReconcileGlobSelection_MixedCaseOwner(t *testing.T) {
+	ctx := context.Background()
+	const gone = "warning not installed: it is no longer listed in its org (deleted, archived or transferred) since this run's preflights evaluated the repository selection"
+	for name, entries := range map[string][]RepoEntry{
+		"explicit entry":  {{Name: "acme/*"}, {Name: "Acme/docs"}},
+		"glob org":        {{Name: "ACME/*"}, {Name: "acme/docs"}},
+		"both mixed-case": {{Name: "aCmE/*"}, {Name: "AcMe/docs"}, {Name: "acme/forked"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := globListingManifest(t)
+			m.GitHub.Repos = entries
+			preflight := preflightOrgListings(t, m, acmeListing("api", "docs"))
+			selected, err := m.ExpandGlobsFor(ctx, preflight.clients(newTestClientFactory(acmeListing())), nil)
+			require.NoError(t, err)
+
+			progress := &progressLog{}
+			kept, dropped, err := reconcileGlobSelection(ctx, m, newTestClientFactory(acmeListing("api")), preflight, nil, selected, progress.fn)
+			require.NoError(t, err)
+			require.Len(t, dropped, 1)
+			assert.Equal(t, "docs", dropped[0].Repo)
+			for _, rr := range kept {
+				assert.NotEqual(t, "docs", rr.Repo)
+			}
+			lines := progress.all()
+			require.Len(t, lines, 1)
+			assert.Contains(t, lines[0], "/docs "+gone)
+		})
+	}
+}
+
+// A live listing that fails stops reconciliation with the error, so
+// convergence cannot probe or write a repository it can no longer tell was
+// removed since the preflights.
 func TestReconcileGlobSelection_ListingError(t *testing.T) {
 	ctx := context.Background()
 	m := globListingManifest(t)
@@ -110,12 +158,101 @@ func TestReconcileGlobSelection_ListingError(t *testing.T) {
 	failing := acmeListing()
 	failing.Errors = map[string]error{"ListOrgRepos": assert.AnError}
 	progress := &progressLog{}
-	kept := reconcileGlobSelection(ctx, m, newTestClientFactory(failing), preflight, nil, selected, progress.fn)
-	assert.Equal(t, selected, kept)
-	lines := progress.all()
-	require.Len(t, lines, 1)
-	assert.Contains(t, lines[0], " warning Could not list glob entries' orgs again")
-	assert.Contains(t, lines[0], assert.AnError.Error())
+	kept, dropped, err := reconcileGlobSelection(ctx, m, newTestClientFactory(failing), preflight, nil, selected, progress.fn)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, assert.AnError)
+	assert.Contains(t, err.Error(), "listing glob entries' orgs again")
+	assert.Nil(t, kept)
+	assert.Nil(t, dropped)
+	assert.Empty(t, progress.all())
+}
+
+// Converge fails before any probe or write when the live listing it
+// compares GlobListing with fails.
+func TestConverge_GlobListingLiveListingErrorFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	m := globListingManifest(t)
+	live := acmeListing("api")
+	preflight := preflightOrgListings(t, m, live)
+	live.Errors = map[string]error{"ListOrgRepos": assert.AnError}
+	progress := &progressLog{}
+	result, err := Converge(ctx, ConvergeConfig{
+		Manifest:       m,
+		MaxConcurrency: 1,
+		GlobListing:    preflight,
+	}, newTestClientFactory(live), nil, progress.fn)
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.ErrorIs(t, err, assert.AnError)
+	assert.Empty(t, progress.all())
+	assertNoForgeWrites(t, live)
+}
+
+// A repository reconcileGlobSelection drops still counts as a consumer of
+// the credential inputs, as an excluded one does: when it is the only
+// consumer of a supplied credential flag, the run still converges the other
+// repositories instead of rejecting the flag as unconsumed. A flag no
+// selected repository uses, dropped or not, is still rejected.
+func TestConverge_GlobListingDroppedRepoCountsAsCredentialConsumer(t *testing.T) {
+	ctx := context.Background()
+	cases := map[string]struct {
+		healthyAuth string
+		dropped     RepoEntry
+		set         func(*ConvergeConfig)
+		wantErr     string
+	}{
+		"openai-api-key": {
+			healthyAuth: InferenceAuthVertexWIF,
+			dropped:     RepoEntry{Name: "acme/docs", Inference: InferenceSettings{Auth: InferenceAuthOpenAIAPIKey}},
+			set:         func(c *ConvergeConfig) { c.OpenAIAPIKey = testOpenAIAPIKey },
+		},
+		"vertex": {
+			healthyAuth: InferenceAuthOpenAIAPIKey,
+			dropped:     RepoEntry{Name: "acme/docs", Inference: InferenceSettings{Auth: InferenceAuthVertexWIF}},
+			set:         func(c *ConvergeConfig) { c.InferenceProject = "test-inference" },
+		},
+		"jira": {
+			healthyAuth: InferenceAuthVertexWIF,
+			dropped:     RepoEntry{Name: "acme/docs"},
+			set:         func(c *ConvergeConfig) { c.JiraToken = testJiraToken },
+		},
+		"unconsumed flag still rejected": {
+			healthyAuth: InferenceAuthVertexWIF,
+			dropped:     RepoEntry{Name: "acme/docs", Inference: InferenceSettings{Auth: InferenceAuthVertexWIF}},
+			set:         func(c *ConvergeConfig) { c.OpenAIAPIKey = testOpenAIAPIKey },
+			wantErr:     "--openai-api-key was supplied but no selected repository uses",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if name == "jira" {
+				tc.dropped.ConfigBase.Source = writePresetFile(t, jiraPollEnabledConfig)
+			}
+			m := newConvergeManifest()
+			m.Defaults.Inference.Auth = tc.healthyAuth
+			m.GitHub.Repos = []RepoEntry{{Name: "acme/*"}, tc.dropped}
+			preflight := preflightOrgListings(t, m, newFakeClientForBatch("acme/api", "acme/docs"))
+			live := newFakeClientForBatch("acme/api")
+			markFullyInstalled(live, "acme", "api")
+			cfg := withoutInferenceInputs(convergeCfgWithDefaults(m))
+			cfg.DryRun = true
+			cfg.GlobListing = preflight
+			tc.set(&cfg)
+			progress := &progressLog{}
+
+			result, err := Converge(ctx, cfg, newTestClientFactory(live), (&fakeScaffoldCommit{}).fn(), progress.fn)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, result.Results, 1)
+			assert.Equal(t, "api", result.Results[0].Repo)
+			assert.Contains(t, progress.all(), "acme/docs warning not installed: it is no longer listed in its org (deleted, archived or transferred) since this run's preflights evaluated the repository selection")
+			assertNoForgeWrites(t, live)
+		})
+	}
 }
 
 // Converge expands glob entries through GlobListing, so a repository only

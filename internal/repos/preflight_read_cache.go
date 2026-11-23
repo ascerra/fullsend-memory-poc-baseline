@@ -189,7 +189,7 @@ func (c *PreflightReadCache) OrgListings() *OrgListings {
 		client.mu.Lock()
 		listings := make(map[orgReposKey][]forge.Repository, len(client.orgRepos))
 		for key, repos := range client.orgRepos {
-			listings[key] = slices.Clone(repos)
+			listings[orgListingKey(key.org, key.includePrivate)] = slices.Clone(repos)
 		}
 		client.mu.Unlock()
 		l.byForge[forgeName] = listings
@@ -201,16 +201,24 @@ func (c *PreflightReadCache) OrgListings() *OrgListings {
 // visibility, taken by PreflightReadCache.OrgListings. It never lists an org
 // itself: expanding a glob whose org it does not hold is an error rather
 // than a live read, so convergence cannot select a repository the preflights
-// did not evaluate.
+// did not evaluate. Org names are matched case-insensitively, as forges
+// treat them and as repository names are compared.
 type OrgListings struct {
 	byForge map[string]map[orgReposKey][]forge.Repository
+}
+
+// orgListingKey returns the OrgListings key for org and visibility: the org
+// name is lower-cased so that, for example, an explicit Acme/docs entry
+// finds the listing an acme/* glob read.
+func orgListingKey(org string, includePrivate bool) orgReposKey {
+	return orgReposKey{org: strings.ToLower(org), includePrivate: includePrivate}
 }
 
 // lists reports whether l holds the listing glob expansion reads for rr's org
 // (private repositories included) and, if it does, whether that listing
 // contains rr.
 func (l *OrgListings) lists(rr ResolvedRepo) (orgListed, repoListed bool) {
-	repos, ok := l.byForge[rr.Forge][orgReposKey{org: rr.Owner, includePrivate: true}]
+	repos, ok := l.byForge[rr.Forge][orgListingKey(rr.Owner, true)]
 	if !ok {
 		return false, false
 	}
@@ -253,7 +261,7 @@ type orgListingsClient struct {
 // ListOrgRepos returns a copy of the snapshot's listing, or an error when
 // the snapshot does not hold one.
 func (c *orgListingsClient) ListOrgRepos(_ context.Context, org string, includePrivate bool) ([]forge.Repository, error) {
-	repos, ok := c.listings.byForge[c.forgeName][orgReposKey{org: org, includePrivate: includePrivate}]
+	repos, ok := c.listings.byForge[c.forgeName][orgListingKey(org, includePrivate)]
 	if !ok {
 		return nil, fmt.Errorf("org %q on %s was not listed by this run's preflights", org, c.forgeName)
 	}
