@@ -776,6 +776,11 @@ drift. The managed `FULLSEND_TRIGGER_TOKEN` and `FULLSEND_WEBHOOK_SECRET`
 variables and the reserved `FULLSEND_TRACE_SIGNING_KEY` are not reported as
 orphans; any other unrecognised `FULLSEND_` variable still is.
 
+On both forges, the Jira polling credentials (`FULLSEND_JIRA_TOKEN`,
+`FULLSEND_JIRA_EMAIL`, `FULLSEND_JIRA_CLIENT_ID`,
+`FULLSEND_JIRA_CLIENT_SECRET`) are also managed and not reported as orphans,
+including when Jira polling is disabled and install leaves them in place.
+
 For repos with a managed `.fullsend/config.yaml` and an explicitly pinned
 `fullsend_ref`, status also checks the installed file against the
 configuration schema that ref reads. It reports

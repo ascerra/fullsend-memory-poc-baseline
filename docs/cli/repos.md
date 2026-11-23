@@ -642,7 +642,8 @@ flag or environment variable supplies them.
   Install removes the Fullsend-owned Jira poll resources. `FULLSEND_JIRA_TOKEN`
   and `FULLSEND_JIRA_EMAIL` (or the client credentials) are left in place
   because other Jira consumers may still need them. `repos uninstall` deletes
-  all four.
+  all four. `repos status` classifies all four as fullsend-managed, never as
+  orphans, including while polling is disabled and they are left in place.
 - **GitLab job exposure.** GitLab injects project-wide CI/CD variables into
   every protected-branch job. The scaffolded webhook dispatcher job, and the
   poll job in slash and event mode, clear the Jira variables (token, email,
