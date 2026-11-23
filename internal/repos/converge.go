@@ -32,6 +32,17 @@ type ConvergeConfig struct {
 	ExcludeRepos   []string
 	MaxConcurrency int
 
+	// GlobListing, when non-nil, expands the manifest's glob entries in
+	// place of the clients passed to Converge, so convergence selects the
+	// repositories the caller's preflights evaluated. repos install passes
+	// its preflight read cache (NewPreflightReadCache), whose org listings
+	// are the ones those preflights read; only ListOrgRepos is used. A
+	// repository a live listing shows but GlobListing does not, such as one
+	// created after the preflights, is left out of this run and reported
+	// through progress so the operator can run install again. Every other
+	// read and every write still goes through the clients.
+	GlobListing ForgeClientFactory
+
 	// UpstreamRef is the git ref (SHA) used to pin scaffold workflow refs.
 	UpstreamRef string
 	// UpstreamTag is the version tag corresponding to UpstreamRef.
@@ -767,6 +778,47 @@ func pristineInstallation(components []ComponentStatus) bool {
 	return true
 }
 
+// reportReposListedAfterSelection lists the manifest's glob orgs again
+// through clients and reports, through progress, each repository the glob
+// entries now match that selected (expanded from ConvergeConfig.GlobListing)
+// does not contain: it appeared after the selection was made, so this run
+// left it out without checking or installing it. Running install again
+// selects it. The listing is only diagnostic: an error is reported and
+// convergence continues with selected.
+func reportReposListedAfterSelection(ctx context.Context, m *Manifest, clients ForgeClientFactory,
+	filter []string, selected []ResolvedRepo, progress ProgressFunc) {
+	live, err := m.ExpandGlobsFor(ctx, clients, filter)
+	if err != nil {
+		progress("", "warning", fmt.Sprintf("Could not list glob entries' orgs again to find repositories created during this run: %v", err))
+		return
+	}
+	known := make(map[string]bool, len(selected))
+	for _, rr := range selected {
+		known[strings.ToLower(rr.Owner+"/"+rr.Repo)] = true
+	}
+	for _, rr := range live {
+		name := rr.Owner + "/" + rr.Repo
+		if known[strings.ToLower(name)] || !matchesAnyPattern(filter, name) {
+			continue
+		}
+		progress(name, "warning", "not installed: it appeared after this run's preflights evaluated the repository selection; run repos install again to install it")
+	}
+}
+
+// matchesAnyPattern reports whether name matches a pattern in filter. An
+// empty filter matches every name; an invalid pattern matches none.
+func matchesAnyPattern(filter []string, name string) bool {
+	if len(filter) == 0 {
+		return true
+	}
+	for _, pattern := range filter {
+		if ok, err := matchesPattern(pattern, name); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Converge processes every repo in the manifest through a single
 // convergence pipeline: probe → diff → apply. For each repo it
 // determines what components exist and what actions are needed, then
@@ -803,7 +855,11 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 		return nil, fmt.Errorf("invalid manifest: %w", err)
 	}
 
-	repos, err := manifest.ExpandGlobsFor(ctx, clients, cfg.RepoFilter)
+	expandClients := clients
+	if cfg.GlobListing != nil {
+		expandClients = cfg.GlobListing
+	}
+	repos, err := manifest.ExpandGlobsFor(ctx, expandClients, cfg.RepoFilter)
 	if err != nil {
 		return nil, fmt.Errorf("expanding globs: %w", err)
 	}
@@ -815,6 +871,9 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 		if err != nil {
 			return nil, err
 		}
+	}
+	if cfg.GlobListing != nil {
+		reportReposListedAfterSelection(ctx, manifest, clients, cfg.RepoFilter, repos, progress)
 	}
 	store := newPresetCache()
 	excludedUsesOpenAI, excludedUsesVertex, excludedUsesJira := false, false, false
