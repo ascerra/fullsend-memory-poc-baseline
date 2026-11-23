@@ -302,3 +302,50 @@ func TestRunReposUninstall_ManifestUnreadableAfterTeardownIsReported(t *testing.
 	assert.Contains(t, err.Error(), "--manifest-only")
 	assert.NoFileExists(t, manifestPath, "the uninstall does not write the copy it loaded")
 }
+
+// A repos.yaml that the teardown leaves empty or without a torn-down entry,
+// as when the uninstall reads it while another command's write has truncated
+// it, stops the uninstall with the --manifest-only hint and nothing is
+// written.
+func TestRunReposUninstall_ManifestIncompleteAfterTeardownIsReported(t *testing.T) {
+	const webOnlyYAML = `version: 1
+defaults:
+  inference:
+    auth: vertex-wif
+github:
+  mint_url: https://mint.example.com
+  fullsend_ref: v1.0.0
+  repos:
+    - name: acme/web
+`
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "empty", content: "", want: "manifest validation failed"},
+		{name: "entry missing", content: webOnlyYAML, want: "no longer lists acme/api"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifestPath := writeTestManifest(t, twoRepoManifestYAML)
+			fc := &teardownHookClient{FakeClient: newInstalledFakeClientCLI("acme/api", "acme/web"), other: func() {
+				require.NoError(t, os.WriteFile(manifestPath, []byte(tc.content), 0o644))
+			}}
+
+			var err error
+			captureStdout(t, func() {
+				err = runReposUninstall(context.Background(), &reposUninstallConfig{
+					manifest:    manifestPath,
+					yes:         true,
+					concurrency: 1,
+					testClient:  fc,
+				}, []string{"acme/api"})
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+			assert.Contains(t, err.Error(), "the teardown of acme/api has finished")
+			assert.Contains(t, err.Error(), "--manifest-only")
+			assert.Equal(t, tc.content, mustReadFile(t, manifestPath), "the uninstall does not write the manifest")
+		})
+	}
+}

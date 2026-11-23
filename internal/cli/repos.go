@@ -1809,16 +1809,34 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 		// once) keeps the loaded copy, so the write gives its own refusal,
 		// and a dry run writes nothing. Loading and writing are not atomic: a
 		// write that lands between them is overwritten.
+		//
+		// The other command's write truncates the file before it fills it, so
+		// the reload can see an empty or partial file. The reloaded copy gets
+		// the validation the first load got, and it must still list every
+		// torn-down repository; otherwise nothing is written.
 		removeFrom := manifest
 		if !opts.dryRun && !repos.ManifestReadOnly(manifest, opts.manifest) {
-			current, reloadErr := repos.LoadManifest(ctx, opts.manifest)
-			if reloadErr != nil {
+			reloadFailed := func(err error) error {
 				if opts.manifestOnly {
-					return fmt.Errorf("loading manifest again before removing entries: %w", reloadErr)
+					return fmt.Errorf("loading manifest again before removing entries: %w", err)
 				}
 				return fmt.Errorf("loading manifest again before removing entries: %w; the teardown of %s has finished: "+
 					"once the manifest can be read, run repos uninstall again with --manifest-only to remove the entries",
-					reloadErr, strings.Join(succeededRepos, ", "))
+					err, strings.Join(succeededRepos, ", "))
+			}
+			current, reloadErr := repos.LoadManifest(ctx, opts.manifest)
+			if reloadErr != nil {
+				return reloadFailed(reloadErr)
+			}
+			if err := current.ValidateForUninstall(); err != nil {
+				return reloadFailed(fmt.Errorf("manifest validation failed: %w", err))
+			}
+			listed, matchErr := repos.MatchManifestRepos(current, succeededRepos)
+			if matchErr != nil {
+				return reloadFailed(matchErr)
+			}
+			if missing := missingRepos(succeededRepos, listed); len(missing) > 0 {
+				return reloadFailed(fmt.Errorf("%s no longer lists %s", opts.manifest, strings.Join(missing, ", ")))
 			}
 			removeFrom = current
 		}
@@ -1847,6 +1865,25 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 		return fmt.Errorf("%d repos failed to uninstall", teardownFailed)
 	}
 	return nil
+}
+
+// missingRepos returns the names in want that listed does not contain,
+// compared case-insensitively as manifest entries are matched.
+func missingRepos(want, listed []string) []string {
+	var missing []string
+	for _, w := range want {
+		found := false
+		for _, l := range listed {
+			if strings.EqualFold(w, l) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, w)
+		}
+	}
+	return missing
 }
 
 // confirmBulkAction prompts for confirmation when a destructive action targets
