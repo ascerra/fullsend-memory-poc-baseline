@@ -1801,8 +1801,29 @@ func runReposUninstall(ctx context.Context, opts *reposUninstallConfig, repoArgs
 
 	// Manifest removal phase (skipped when --uninstall-only).
 	if !opts.uninstallOnly && len(succeededRepos) > 0 {
+		// Another command that uses the same file, such as a repos install
+		// recording a first-install tracker default or a trace_context, may
+		// have rewritten it during the teardown. Writing back the copy loaded
+		// above would drop its edits, so the entries are removed from the
+		// file as it is now. A read-only manifest (a pipe can be read only
+		// once) keeps the loaded copy, so the write gives its own refusal,
+		// and a dry run writes nothing. Loading and writing are not atomic: a
+		// write that lands between them is overwritten.
+		removeFrom := manifest
+		if !opts.dryRun && !repos.ManifestReadOnly(manifest, opts.manifest) {
+			current, reloadErr := repos.LoadManifest(ctx, opts.manifest)
+			if reloadErr != nil {
+				if opts.manifestOnly {
+					return fmt.Errorf("loading manifest again before removing entries: %w", reloadErr)
+				}
+				return fmt.Errorf("loading manifest again before removing entries: %w; the teardown of %s has finished: "+
+					"once the manifest can be read, run repos uninstall again with --manifest-only to remove the entries",
+					reloadErr, strings.Join(succeededRepos, ", "))
+			}
+			removeFrom = current
+		}
 		removeResult, _, removeErr := repos.RemoveFromManifest(repos.ManifestEditConfig{
-			Manifest:     manifest,
+			Manifest:     removeFrom,
 			ManifestPath: opts.manifest,
 			DryRun:       opts.dryRun,
 		}, succeededRepos, progressFn)
