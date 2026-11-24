@@ -13,7 +13,8 @@ var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // scripts place in a child process's environment. It recognizes three forms:
 //
 //   - export statements, both "export NAME=value" and the bare re-export
-//     "export NAME";
+//     "export NAME"; "export -n NAME" removes NAME again, so scripts are
+//     read in order and a name un-exported last is not reported;
 //   - prefix assignments on a command ("NAME=value cmd" and
 //     "env NAME=value cmd"), which the command's process inherits;
 //   - the same forms inside the script argument of "sh -c" or "bash -c",
@@ -102,14 +103,35 @@ func collectFromCommand(words []shellWord, seen map[string]bool, depth int) {
 	}
 	switch cmd {
 	case "export":
+		// Leading option words end at the first non-option word or "--".
+		// -n (alone or combined, as in -pn) removes the export attribute,
+		// so the listed names leave the environment instead of joining it.
+		unexport := false
+		for len(args) > 0 && strings.HasPrefix(args[0].text, "-") {
+			opt := args[0].text
+			args = args[1:]
+			if opt == "--" {
+				break
+			}
+			if strings.Contains(opt[1:], "n") {
+				unexport = true
+			}
+		}
 		for _, a := range args {
 			if strings.HasPrefix(a.text, "-") {
 				continue
 			}
-			if name := a.assignmentName(); name != "" {
+			name := a.assignmentName()
+			if name == "" && envNameRe.MatchString(a.text) {
+				name = a.text
+			}
+			if name == "" {
+				continue
+			}
+			if unexport {
+				delete(seen, name)
+			} else {
 				seen[name] = true
-			} else if envNameRe.MatchString(a.text) {
-				seen[a.text] = true
 			}
 		}
 	case "env":
@@ -129,7 +151,14 @@ func collectFromCommand(words []shellWord, seen map[string]bool, depth int) {
 	case "sh", "bash", "/bin/sh", "/bin/bash":
 		for j, a := range args {
 			if strings.HasPrefix(a.text, "-") && strings.Contains(a.text, "c") && j+1 < len(args) {
-				collectExportedNames(args[j+1].text, seen, depth+1)
+				// The child shell has its own export state: an "export -n"
+				// inside it cannot un-export a name the caller already
+				// placed in the child's environment.
+				inner := map[string]bool{}
+				collectExportedNames(args[j+1].text, inner, depth+1)
+				for name := range inner {
+					seen[name] = true
+				}
 				return
 			}
 		}
