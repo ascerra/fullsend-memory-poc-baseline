@@ -233,7 +233,7 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 	// Seed from the overlay's own entry so an unset flag keeps this
 	// layer's value: seeding from the merged entry would freeze the
 	// parent layer's values (and its subagents map) into this config.
-	current, _ := config.AgentSettingsFor(localAgentEntries(cfg), agentName)
+	current := firstAgentEntry(localAgentEntries(cfg), agentName)
 	runtimeName, model, effort := current.Runtime, current.Model, current.Effort
 	if f.runtimeSet {
 		runtimeName = f.runtime
@@ -351,6 +351,21 @@ func localAgentEntries(cfg config.ConfigReader) []config.AgentEntry {
 		return local.LocalAgentEntries()
 	}
 	return cfg.AgentEntries()
+}
+
+// firstAgentEntry returns the first entry for name (case-insensitive) in a
+// layer's local agent list, or a zero entry when there is none. It is the
+// entry config.UpsertAgentSettings writes, so reading it keeps read and
+// write on the same entry when a layer holds both an enabled and a
+// disabled entry for name (config.AgentSettingsFor returns the last).
+func firstAgentEntry(agents []config.AgentEntry, name string) config.AgentEntry {
+	lower := strings.ToLower(name)
+	for _, a := range agents {
+		if strings.ToLower(a.DerivedName()) == lower {
+			return a
+		}
+	}
+	return config.AgentEntry{}
 }
 
 // localAllowedResources returns the allowlist entries the overlay itself

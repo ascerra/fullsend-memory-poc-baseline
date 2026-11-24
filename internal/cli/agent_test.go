@@ -1932,6 +1932,22 @@ agents:
 		assert.Equal(t, config.AgentEntry{Name: "lint", Effort: "low"}, local)
 		assert.Equal(t, "opus", effective.Model, "base model inherited again")
 	})
+
+	// The overlay may hold an enabled and a disabled entry for one name.
+	// UpsertAgentSettings writes the first, so the seed must read that
+	// entry too, not the last one AgentSettingsFor returns.
+	t.Run("enabled and disabled entries: seed read from the entry written", func(t *testing.T) {
+		dir := setup(t, "agents:\n  - source: harness/lint.yaml\n    model: haiku\n  - name: lint\n    enabled: false\n")
+		require.NoError(t, runAgentSet(dir, "lint", agentSetFlags{effort: "high", effortSet: true}, ui.New(&bytes.Buffer{})))
+		cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+		require.NoError(t, err)
+		local := localAgentEntries(cfg)
+		require.Len(t, local, 2)
+		assert.Equal(t, "haiku", local[0].Model, "local model kept")
+		assert.Equal(t, "high", local[0].Effort)
+		assert.Equal(t, config.AgentEntry{Name: "lint", Enabled: local[1].Enabled}, local[1], "disabled entry untouched")
+		assert.False(t, local[1].IsEnabled())
+	})
 }
 
 // agent add and agent remove write only the overlay's own entries, not the base layer's.
