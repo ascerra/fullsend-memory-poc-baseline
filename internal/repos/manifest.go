@@ -1160,10 +1160,13 @@ func (m *Manifest) ExpandGlobsFor(ctx context.Context, clients ForgeClientFactor
 			}
 		}
 
-		// Expand each glob pattern.
+		// Expand each glob pattern. Orgs are listed once per
+		// case-insensitive name, so globs whose orgs differ only in case
+		// expand from one listing.
 		orgRepoCache := make(map[string][]forge.Repository)
 		for _, g := range globs {
-			repos, ok := orgRepoCache[g.org]
+			orgKey := strings.ToLower(g.org)
+			repos, ok := orgRepoCache[orgKey]
 			if !ok {
 				fc, err := clients.ConfigFor(p.name)
 				if err != nil {
@@ -1173,7 +1176,7 @@ func (m *Manifest) ExpandGlobsFor(ctx context.Context, clients ForgeClientFactor
 				if err != nil {
 					return nil, fmt.Errorf("expanding glob %q: listing repos for org %q: %w", g.org+"/"+g.pattern, g.org, err)
 				}
-				orgRepoCache[g.org] = repos
+				orgRepoCache[orgKey] = repos
 			}
 
 			for _, repo := range repos {

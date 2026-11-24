@@ -43,7 +43,11 @@ type ConvergeConfig struct {
 	// run and reported so the operator can run install again; a selected
 	// repository GlobListing lists but the live listing no longer does,
 	// such as one deleted, archived or transferred since, is dropped and
-	// reported. Every other read and every write goes through the clients.
+	// reported, but still counts as a consumer of the credential inputs, as
+	// an excluded repository does. If that live listing fails, convergence
+	// fails before any probe or write. Org names are compared
+	// case-insensitively. Every other read and every write goes through the
+	// clients.
 	GlobListing *OrgListings
 
 	// UpstreamRef is the git ref (SHA) used to pin scaffold workflow refs.
@@ -792,19 +796,24 @@ func pristineInstallation(components []ComponentStatus) bool {
 // deleted, archived or transferred since, so it is not probed or written.
 // The preflights may have given such a repository its own manifest entry,
 // so this does not depend on whether it is still glob-selected; one neither
-// listing showed, such as an explicit entry for a fork, is kept. If the live
-// listing fails, a warning is reported and selected is returned unchanged.
+// listing showed, such as an explicit entry for a fork, is kept. Org names
+// are compared case-insensitively, as repository names are. It returns the
+// repositories it kept and those it dropped; a dropped repository is still
+// part of the selection the credential inputs are validated against, as an
+// excluded one is. If the live listing fails, it returns the error and
+// convergence fails before any probe or write: without that listing a
+// repository removed since the preflights cannot be told apart, and could
+// otherwise be written through a forge redirect.
 func reconcileGlobSelection(ctx context.Context, m *Manifest, clients ForgeClientFactory,
-	preflight *OrgListings, filter []string, selected []ResolvedRepo, progress ProgressFunc) []ResolvedRepo {
+	preflight *OrgListings, filter []string, selected []ResolvedRepo, progress ProgressFunc) (kept, dropped []ResolvedRepo, err error) {
 	liveClients := NewPreflightReadCache(clients)
 	live, err := m.ExpandGlobsFor(ctx, liveClients, filter)
 	if err != nil {
-		progress("", "warning", fmt.Sprintf("Could not list glob entries' orgs again to compare with this run's repository selection: %v", err))
-		return selected
+		return nil, nil, fmt.Errorf("listing glob entries' orgs again to compare with this run's repository selection: %w", err)
 	}
 	liveListings := liveClients.OrgListings()
 	known := make(map[string]bool, len(selected))
-	kept := make([]ResolvedRepo, 0, len(selected))
+	kept = make([]ResolvedRepo, 0, len(selected))
 	for _, rr := range selected {
 		name := rr.Owner + "/" + rr.Repo
 		known[strings.ToLower(name)] = true
@@ -812,6 +821,7 @@ func reconcileGlobSelection(ctx context.Context, m *Manifest, clients ForgeClien
 		orgListed, stillListed := liveListings.lists(rr)
 		if wasListed && orgListed && !stillListed {
 			progress(name, "warning", "not installed: it is no longer listed in its org (deleted, archived or transferred) since this run's preflights evaluated the repository selection")
+			dropped = append(dropped, rr)
 			continue
 		}
 		kept = append(kept, rr)
@@ -823,7 +833,41 @@ func reconcileGlobSelection(ctx context.Context, m *Manifest, clients ForgeClien
 		}
 		progress(name, "warning", "not installed: it appeared after this run's preflights evaluated the repository selection; run repos install again to install it")
 	}
-	return kept
+	return kept, dropped, nil
+}
+
+// skippedCredentialConsumers reports which credential input groups the
+// skipped repositories consume: those excluded by ConvergeConfig.ExcludeRepos
+// and those reconcileGlobSelection dropped. A skipped repo takes no write,
+// but it is still part of the selection the credential inputs are validated
+// against, so a skipped consumer does not fail the run for the others.
+func skippedCredentialConsumers(ctx context.Context, manifest *Manifest, store *presetCache,
+	skipped []ResolvedRepo) (usesOpenAI, usesVertex, usesJira bool) {
+	for _, rr := range skipped {
+		resolved := manifest.ResolveConfigForEntry(rr.Owner, rr.Repo, rr.Forge, rr.Entry)
+		switch resolved.InferenceAuth {
+		case InferenceAuthOpenAIAPIKey:
+			usesOpenAI = true
+		case InferenceAuthVertexWIF, InferenceAuthOpenAIWIF:
+			usesVertex = true
+		}
+		// Polling can be enabled by the declared preset alone, so the
+		// preset is read (never written) to see the same effective
+		// configuration a selected repo would. A preset that cannot be
+		// loaded, or a configuration that does not resolve, counts the
+		// repo as a consumer: the run is not failed on its account.
+		var preset []byte
+		var presetErr error
+		if resolved.Config != "" {
+			preset, presetErr = store.Load(ctx, resolved.Config, resolved.ConfigHash)
+		}
+		if presetErr != nil {
+			usesJira = true
+		} else if jira, jiraErr := effectiveJiraTracking(resolved, preset); jiraErr != nil || jira.PollEnabled() {
+			usesJira = true
+		}
+	}
+	return usesOpenAI, usesVertex, usesJira
 }
 
 // Converge processes every repo in the manifest through a single
@@ -879,11 +923,16 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 			return nil, err
 		}
 	}
+	// skipped holds the selected repos that take no write but still count
+	// as credential consumers (skippedCredentialConsumers).
+	var skipped []ResolvedRepo
 	if cfg.GlobListing != nil {
-		repos = reconcileGlobSelection(ctx, manifest, clients, cfg.GlobListing, cfg.RepoFilter, repos, progress)
+		repos, skipped, err = reconcileGlobSelection(ctx, manifest, clients, cfg.GlobListing, cfg.RepoFilter, repos, progress)
+		if err != nil {
+			return nil, err
+		}
 	}
 	store := newPresetCache()
-	excludedUsesOpenAI, excludedUsesVertex, excludedUsesJira := false, false, false
 	if len(cfg.ExcludeRepos) > 0 {
 		excluded := make(map[string]bool, len(cfg.ExcludeRepos))
 		for _, name := range cfg.ExcludeRepos {
@@ -895,34 +944,11 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 				kept = append(kept, rr)
 				continue
 			}
-			// An excluded repo takes no write, but it is still part of the
-			// selection the credential inputs are validated against, so a
-			// skipped consumer does not fail the run for the others.
-			excludedResolved := manifest.ResolveConfigForEntry(rr.Owner, rr.Repo, rr.Forge, rr.Entry)
-			switch excludedResolved.InferenceAuth {
-			case InferenceAuthOpenAIAPIKey:
-				excludedUsesOpenAI = true
-			case InferenceAuthVertexWIF, InferenceAuthOpenAIWIF:
-				excludedUsesVertex = true
-			}
-			// Polling can be enabled by the declared preset alone, so the
-			// preset is read (never written) to see the same effective
-			// configuration a selected repo would. A preset that cannot be
-			// loaded, or a configuration that does not resolve, counts the
-			// repo as a consumer: the run is not failed on its account.
-			var excludedPreset []byte
-			var presetErr error
-			if excludedResolved.Config != "" {
-				excludedPreset, presetErr = store.Load(ctx, excludedResolved.Config, excludedResolved.ConfigHash)
-			}
-			if presetErr != nil {
-				excludedUsesJira = true
-			} else if jira, jiraErr := effectiveJiraTracking(excludedResolved, excludedPreset); jiraErr != nil || jira.PollEnabled() {
-				excludedUsesJira = true
-			}
+			skipped = append(skipped, rr)
 		}
 		repos = kept
 	}
+	skippedUsesOpenAI, skippedUsesVertex, skippedUsesJira := skippedCredentialConsumers(ctx, manifest, store, skipped)
 	if len(repos) == 0 {
 		return &ConvergeBatchResult{}, nil
 	}
@@ -1178,9 +1204,10 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 	// Reject credential inputs that no selected repository consumes, before
 	// any write: silently ignoring them would leave the caller believing the
 	// credentials were provisioned. Mixed fleets keep working because each
-	// input group only needs one consumer. Excluded repos still count as
-	// consumers (they remain selected) but receive no write.
-	usesOpenAI, usesVertex := excludedUsesOpenAI, excludedUsesVertex
+	// input group only needs one consumer. Excluded repos, and repos
+	// reconcileGlobSelection dropped, still count as consumers (they remain
+	// selected) but receive no write.
+	usesOpenAI, usesVertex := skippedUsesOpenAI, skippedUsesVertex
 	for _, d := range discoveries {
 		switch d.resolved.InferenceAuth {
 		case InferenceAuthOpenAIAPIKey:
@@ -1202,7 +1229,7 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 	}
 	// A repository whose discovery failed may still enable Jira polling;
 	// it is reported on its own rather than failing the whole run.
-	usesJira := excludedUsesJira
+	usesJira := skippedUsesJira
 	for _, d := range discoveries {
 		if d.jira.enabled || d.configErr != nil || d.err != nil {
 			usesJira = true
