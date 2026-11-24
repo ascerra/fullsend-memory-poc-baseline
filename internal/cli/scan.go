@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -216,7 +217,10 @@ func newScanContextCmd() *cobra.Command {
 they are loaded into an agent's system prompt.
 
 Pass file paths as arguments, or use --dir to scan a directory.
-Only scans known context filenames (AGENTS.md, CLAUDE.md, .cursorrules, etc.).`,
+Only scans known context filenames (AGENTS.md, CLAUDE.md, .cursorrules, etc.).
+
+Exits non-zero if critical findings are detected or if a requested known
+context file cannot be read. Unknown filenames are skipped.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			printer := ui.New(os.Stdout)
@@ -225,6 +229,9 @@ Only scans known context filenames (AGENTS.md, CLAUDE.md, .cursorrules, etc.).`,
 			scanner := security.NewContextInjectionScanner()
 			normalizer := security.NewUnicodeNormalizer()
 			var allFindings []security.Finding
+			// Known context files that were requested but could not be read.
+			// A scan that skipped them must not report a clean result.
+			var unreadable []string
 
 			for _, path := range args {
 				basename := baseName(path)
@@ -235,7 +242,8 @@ Only scans known context filenames (AGENTS.md, CLAUDE.md, .cursorrules, etc.).`,
 
 				content, err := os.ReadFile(path)
 				if err != nil {
-					printer.StepWarn(fmt.Sprintf("Could not read %s: %v", path, err))
+					printer.StepFail(fmt.Sprintf("Could not read %s: %v", path, err))
+					unreadable = append(unreadable, path)
 					continue
 				}
 
@@ -262,10 +270,20 @@ Only scans known context filenames (AGENTS.md, CLAUDE.md, .cursorrules, etc.).`,
 				}
 			}
 
+			var errs []error
 			if hasCriticalFindings(allFindings) {
 				count := countCritical(allFindings)
 				printer.StepFail(fmt.Sprintf("BLOCKED: %d critical finding(s) in context files", count))
-				return fmt.Errorf("context scan blocked: %d critical findings", count)
+				errs = append(errs, fmt.Errorf("context scan blocked: %d critical findings", count))
+			}
+			if len(unreadable) > 0 {
+				printer.StepFail(fmt.Sprintf("FAILED: could not read %d requested context file(s): %s",
+					len(unreadable), strings.Join(unreadable, ", ")))
+				errs = append(errs, fmt.Errorf("context scan incomplete: could not read %s",
+					strings.Join(unreadable, ", ")))
+			}
+			if len(errs) > 0 {
+				return errors.Join(errs...)
 			}
 
 			if len(allFindings) == 0 {
