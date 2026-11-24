@@ -230,8 +230,10 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 		return fmt.Errorf("agent set applies to per-repo configs; %s is an org config", configPath)
 	}
 
-	// Start from the current effective values so an unset flag keeps them.
-	current, _ := config.AgentSettingsFor(cfg.AgentEntries(), agentName)
+	// Seed from the overlay's own entry so an unset flag keeps this
+	// layer's value: seeding from the merged entry would freeze the
+	// parent layer's values (and its subagents map) into this config.
+	current, _ := config.AgentSettingsFor(localAgentEntries(cfg), agentName)
 	runtimeName, model, effort := current.Runtime, current.Model, current.Effort
 	if f.runtimeSet {
 		runtimeName = f.runtime
@@ -243,14 +245,10 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 		effort = f.effort
 	}
 
-	// Seed from the overlay's own entry: writing the merged map back
-	// would freeze the parent layer's entries into this config.
-	localSubagents, _ := config.AgentSettingsFor(localAgentEntries(cfg), agentName)
-
 	var subagents map[string]*string
-	if localSubagents.Subagents != nil {
-		subagents = make(map[string]*string, len(localSubagents.Subagents))
-		for k, v := range localSubagents.Subagents {
+	if current.Subagents != nil {
+		subagents = make(map[string]*string, len(current.Subagents))
+		for k, v := range current.Subagents {
 			// A nil value is a tombstone; carry it over rather than
 			// dereferencing it.
 			if v == nil {
@@ -315,7 +313,10 @@ func runAgentSet(fullsendDir, agentName string, f agentSetFlags, printer *ui.Pri
 	}
 	printer.StepDone(msg)
 	if f.subagentSet {
-		warnOpenAISubagentWithoutProvider(cfg, absDir, agentName, runtimeName, subagents, printer)
+		// The warning needs the effective runtime, which may be inherited
+		// from the parent layer rather than written here.
+		effective, _ := config.AgentSettingsFor(cfg.AgentEntries(), agentName)
+		warnOpenAISubagentWithoutProvider(cfg, absDir, agentName, effective.Runtime, subagents, printer)
 	}
 	return nil
 }
