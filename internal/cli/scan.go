@@ -216,7 +216,7 @@ func newScanContextCmd() *cobra.Command {
 		Long: `Scans project context files for prompt injection patterns before
 they are loaded into an agent's system prompt.
 
-Pass file paths as arguments, or use --dir to scan a directory.
+Pass file paths as arguments.
 Only scans known context filenames (AGENTS.md, CLAUDE.md, .cursorrules, etc.).
 
 Exits non-zero if critical findings are detected or if a requested known
