@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,19 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/fetchsvc"
 	"github.com/fullsend-ai/fullsend/internal/harness"
 )
+
+// loopbackAddr rewrites the fetch service's listener address (0.0.0.0:<port>,
+// per ADR-0046) to 127.0.0.1:<port> for the test client to dial. Some sandbox
+// network policies deny connecting to the unspecified address, while loopback
+// reaches the same listener.
+func loopbackAddr(t *testing.T, addr string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("parsing fetch service addr %q: %v", addr, err)
+	}
+	return net.JoinHostPort("127.0.0.1", port)
+}
 
 func TestStartFetchService_StartsAndStops(t *testing.T) {
 	cfg := fetchsvc.ServiceConfig{
@@ -39,7 +53,7 @@ func TestStartFetchService_StartsAndStops(t *testing.T) {
 	}
 
 	// Health endpoint should be reachable without auth.
-	resp, err := http.Get(fmt.Sprintf("http://%s/healthz", addr))
+	resp, err := http.Get(fmt.Sprintf("http://%s/healthz", loopbackAddr(t, addr)))
 	if err != nil {
 		t.Fatalf("healthz request failed: %v", err)
 	}
@@ -76,7 +90,7 @@ func TestStartFetchService_FetchEndpoint(t *testing.T) {
 	body, _ := json.Marshal(fetchsvc.FetchRequest{
 		URL: "https://github.com/org/repo/tree/abc/skills/test#sha256=" + hash,
 	})
-	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/fetch", addr), bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/fetch", loopbackAddr(t, addr)), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
@@ -114,7 +128,7 @@ func TestStartFetchService_RejectsWithoutAuth(t *testing.T) {
 	defer shutdown()
 
 	body, _ := json.Marshal(fetchsvc.FetchRequest{URL: "https://example.com/skill#sha256=aaa"})
-	resp, err := http.Post(fmt.Sprintf("http://%s/fetch", addr), "application/json", bytes.NewReader(body))
+	resp, err := http.Post(fmt.Sprintf("http://%s/fetch", loopbackAddr(t, addr)), "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -139,7 +153,7 @@ func TestStartFetchService_RejectsWrongToken(t *testing.T) {
 	defer shutdown()
 
 	body, _ := json.Marshal(fetchsvc.FetchRequest{URL: "https://example.com/skill#sha256=aaa"})
-	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/fetch", addr), bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/fetch", loopbackAddr(t, addr)), bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer wrong-token")
 
 	resp, err := http.DefaultClient.Do(req)
