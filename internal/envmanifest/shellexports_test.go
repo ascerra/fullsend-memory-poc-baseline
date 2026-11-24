@@ -35,13 +35,21 @@ func TestExportedNames(t *testing.T) {
 		{"export -n after || on the next line", []string{"export FOO=1; true ||\nexport -n FOO"}, []string{"FOO"}},
 		{"export -n before &&", []string{"export FOO=1; export -n FOO && cmd"}, []string{"FOO"}},
 		{"export -n in the background", []string{"export FOO=1; export -n FOO &"}, []string{"FOO"}},
-		{"export -n after a background job", []string{"export FOO=1; cmd & export -n FOO"}, []string{}},
+		{"export -n after a background job", []string{"export FOO=1; cmd & export -n FOO"}, []string{"FOO"}},
 		{"export -n in a function body", []string{"export FOO=1; f() { export -n FOO; }"}, []string{"FOO"}},
 		{"export -n in an if body", []string{"export FOO=1\nif cond; then\n  export -n FOO\nfi"}, []string{"FOO"}},
-		{"export -n after a closed if", []string{"export FOO=1\nif cond; then\n  cmd\nfi\nexport -n FOO"}, []string{}},
-		{"export -n after a closed group", []string{"export FOO=1; ( cmd ) && { cmd; }; export -n FOO"}, []string{}},
+		{"export -n after a closed if", []string{"export FOO=1\nif cond; then\n  cmd\nfi\nexport -n FOO"}, []string{"FOO"}},
+		{"export -n after a closed group", []string{"export FOO=1; ( cmd ) && { cmd; }; export -n FOO"}, []string{"FOO"}},
 		{"case pattern does not close a subshell", []string{"export FOO=1; ( case x in a) cmd;; esac; export -n FOO )"}, []string{"FOO"}},
-		{"export -n after a closed case", []string{"export FOO=1; case x in a) cmd;; esac; export -n FOO"}, []string{}},
+		{"export -n after a closed case", []string{"export FOO=1; case x in a) cmd;; esac; export -n FOO"}, []string{"FOO"}},
+		{"export -n after a child keeps the name", []string{"export FOO=1; cmd; export -n FOO"}, []string{"FOO"}},
+		{"export -n after a child keeps the name in sh -c", []string{`sh -c 'export FOO=1; cmd; export -n FOO'`}, []string{"FOO"}},
+		{"export -n after a child in an earlier script", []string{"export FOO=1; cmd", "export -n FOO"}, []string{"FOO"}},
+		{"export -n after only builtins removes", []string{"export FOO=1; echo hi; export -n FOO"}, []string{}},
+		{"export -n in a same-line nested if", []string{"export FOO=1\nif a; then if b; then c; fi\nexport -n FOO\nfi"}, []string{"FOO"}},
+		{"export -n in a nested for and if", []string{"export FOO=1; for f in a; do if t; then x; fi; export -n FOO; done"}, []string{"FOO"}},
+		{"export -n in a here-document body", []string{"export FOO=1; read -r x <<EOF\nexport -n FOO\nEOF"}, []string{"FOO"}},
+		{"export -n in a here-document before a child", []string{"export FOO=1; cat > s.sh <<EOF\nexport -n FOO\nEOF\n./child"}, []string{"FOO"}},
 		{"export -fn keeps the variable", []string{"export FOO=1; export -fn FOO"}, []string{"FOO"}},
 		{"plain assignment is shell-local", []string{"FOO=bar"}, []string{}},
 		{"readonly assignment is shell-local", []string{"readonly FOO=bar"}, []string{}},
@@ -68,6 +76,39 @@ func TestExportedNames(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, ExportedNames(tt.scripts...))
+		})
+	}
+}
+
+func TestShellCommandsSimple(t *testing.T) {
+	tests := []struct {
+		name   string
+		script string
+		want   bool
+	}{
+		{"semicolons and newlines", "export A=1; cmd\nexport -n A # note", true},
+		{"quoted operators are data", `echo "a && b | c (d) {e}"; echo 'f & g'`, true},
+		{"braces inside a word", "echo ${A}x{y}", true},
+		{"quoted reserved word", `'if' x`, true},
+		{"reserved word as an argument", "echo if then fi", true},
+		{"command substitution", `X="$(a | b)"; Y=$(c && d)`, true},
+		{"and list", "a && b", false},
+		{"or list", "a || b", false},
+		{"pipeline", "a | b", false},
+		{"background job", "a & b", false},
+		{"subshell", "( a )", false},
+		{"brace group", "{ a; }", false},
+		{"if", "if a; then b; fi", false},
+		{"same-line nested if", "if a; then if b; then c; fi\nd\nfi", false},
+		{"for", "for f in a; do b; done", false},
+		{"while", "while a; do b; done", false},
+		{"negated command", "! a", false},
+		{"here-document", "cat <<EOF\nexport -n A\nEOF", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, simple := shellCommands(tt.script)
+			assert.Equal(t, tt.want, simple)
 		})
 	}
 }

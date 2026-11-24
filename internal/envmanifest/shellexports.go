@@ -13,8 +13,8 @@ var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // scripts place in a child process's environment. It recognizes three forms:
 //
 //   - export statements, both "export NAME=value" and the bare re-export
-//     "export NAME"; "export -n NAME" removes the export again, so scripts
-//     are read in order and a name un-exported last is not reported;
+//     "export NAME"; "export -n NAME" can remove the export again (see
+//     below), so scripts are read in order;
 //   - prefix assignments on a command ("NAME=value cmd" and
 //     "env NAME=value cmd"), which the command's process inherits;
 //   - the same forms inside the script argument of "sh -c" or "bash -c",
@@ -29,13 +29,17 @@ var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // $(...) nesting, comments, and the ; && || | & ( ) { } newline
 // separators, which is the subset the runner's emitters generate.
 //
-// "export -n" only clears the export attribute. A name a child already
-// received through a prefix assignment, "env NAME=", or an "sh -c" child's
-// own export stays reported. Because the tokenizer does not model scope,
-// "export -n" removes a name only when it runs unconditionally in the
-// current shell (see shellCommand.scoped). "export -fn" names functions
-// and never removes a variable. On any doubt the name stays reported:
-// over-reporting is the safe direction for an env coverage check.
+// "export -n" only clears the export attribute, so a name a child already
+// received stays reported. A child receives a name through a prefix
+// assignment, through "env NAME=", or through an "sh -c" child's own
+// export. It also receives every exported name when any non-builtin
+// command runs after the export. Because the tokenizer does not model
+// scope, "export -n" removes a name only in a script that is a plain list
+// of commands (see shellCommands). It removes nothing in a script with
+// any group, operator, compound command or here-document. "export -fn"
+// names functions and never removes a variable. On any doubt the name
+// stays reported: over-reporting is the safe direction for an env
+// coverage check.
 func ExportedNames(scripts ...string) []string {
 	st := newExportState()
 	for _, script := range scripts {
@@ -56,8 +60,9 @@ func ExportedNames(scripts ...string) []string {
 
 // exportState keeps the two ways a name reaches a child's environment
 // apart. delivered holds names a child process already received (prefix
-// assignments, "env NAME=", and whatever an "sh -c" child exported);
-// nothing the script does afterwards takes them back. exported holds the
+// assignments, "env NAME=", whatever an "sh -c" child exported, and the
+// exported names at the time a non-builtin command ran); nothing the
+// script does afterwards takes them back. exported holds the
 // names carrying the shell's export attribute, which "export -n" clears.
 type exportState struct {
 	delivered map[string]bool
@@ -106,14 +111,16 @@ func collectExportedNames(script string, st *exportState, depth int) {
 	if depth > maxShellDepth {
 		return
 	}
-	for _, c := range shellCommands(script) {
-		collectFromCommand(c.words, c.scoped, st, depth)
+	cmds, simple := shellCommands(script)
+	for _, words := range cmds {
+		collectFromCommand(words, simple, st, depth)
 	}
 }
 
-// collectFromCommand records the names one simple command exports. scoped
-// is the command's shellCommand.scoped flag.
-func collectFromCommand(words []shellWord, scoped bool, st *exportState, depth int) {
+// collectFromCommand records the names one simple command exports. simple
+// is shellCommands' verdict on the enclosing script; "export -n" removes
+// names only when it is true.
+func collectFromCommand(words []shellWord, simple bool, st *exportState, depth int) {
 	// Leading NAME=value words are prefix assignments when a command
 	// follows them, and shell-local assignments when nothing does.
 	i := 0
@@ -127,6 +134,14 @@ func collectFromCommand(words []shellWord, scoped bool, st *exportState, depth i
 	if !shellBuiltins[cmd] {
 		for _, w := range words[:i] {
 			st.delivered[w.assignmentName()] = true
+		}
+		if cmd != "export" {
+			// The command may start a child process, which inherits every
+			// name exported so far; a later "export -n" cannot take that
+			// back.
+			for name := range st.exported {
+				st.delivered[name] = true
+			}
 		}
 	}
 	switch cmd {
@@ -148,9 +163,6 @@ func collectFromCommand(words []shellWord, scoped bool, st *exportState, depth i
 		}
 		unexport = unexport && !functions
 		for _, a := range args {
-			if strings.HasPrefix(a.text, "-") {
-				continue
-			}
 			name := a.assignmentName()
 			if name == "" && envNameRe.MatchString(a.text) {
 				name = a.text
@@ -161,7 +173,7 @@ func collectFromCommand(words []shellWord, scoped bool, st *exportState, depth i
 			switch {
 			case !unexport:
 				st.exported[name] = true
-			case !scoped:
+			case simple:
 				delete(st.exported, name)
 			}
 		}
@@ -172,13 +184,13 @@ func collectFromCommand(words []shellWord, scoped bool, st *exportState, depth i
 			}
 			name := a.assignmentName()
 			if name == "" {
-				collectFromCommand(args[j:], scoped, st, depth)
+				collectFromCommand(args[j:], simple, st, depth)
 				return
 			}
 			st.delivered[name] = true
 		}
 	case "exec", "command", "nohup":
-		collectFromCommand(args, scoped, st, depth)
+		collectFromCommand(args, simple, st, depth)
 	case "sh", "bash", "/bin/sh", "/bin/bash":
 		for j, a := range args {
 			if strings.HasPrefix(a.text, "-") && strings.Contains(a.text, "c") && j+1 < len(args) {
@@ -200,43 +212,33 @@ func collectFromCommand(words []shellWord, scoped bool, st *exportState, depth i
 	}
 }
 
-// shellCommand is one simple command: its words with quotes removed.
-// scoped records that the command might not run unconditionally in the
-// current shell: it sits inside ( ) or { } (subshells, groups, function
-// bodies) or an if/while/until/for/case/select body, it is joined to a
-// neighbor by && || | |&, or it runs in the background with &. The
-// tokenizer cannot tell those apart, so it marks them all.
-type shellCommand struct {
-	words  []shellWord
-	scoped bool
+// shellReserved are the reserved words that open, continue or close a
+// compound command (or prefix a pipeline) when they start a command.
+var shellReserved = map[string]bool{
+	"!": true, "case": true, "coproc": true, "do": true, "done": true,
+	"elif": true, "else": true, "esac": true, "fi": true, "for": true,
+	"function": true, "if": true, "select": true, "then": true, "time": true,
+	"until": true, "while": true,
 }
 
-// joinsNext and joinsPrev are the operators that make the command before
-// or after them scoped. A command after a background "&" still runs in
-// the current shell.
-var (
-	joinsNext = map[string]bool{"&": true, "&&": true, "||": true, "|": true, "|&": true}
-	joinsPrev = map[string]bool{"&&": true, "||": true, "|": true, "|&": true}
-)
-
-// shellCommands splits script into simple commands. Command substitutions
-// are kept as opaque word text.
-func shellCommands(script string) []shellCommand {
+// shellCommands splits script into simple commands, each a list of words
+// with quotes removed. Command substitutions are kept as opaque word text.
+//
+// simple reports that script is a plain list: its commands are separated
+// only by ";" and newlines, and none starts with a reserved word, so each
+// one runs unconditionally, in order, in the current shell. Any ( ) { }
+// group, & && || | |& operator, compound command or here-document makes
+// it false, because the tokenizer splits those but does not model their
+// scope.
+func shellCommands(script string) (cmds [][]shellWord, simple bool) {
 	var (
-		cmds       []shellCommand
 		words      []shellWord
 		cur        strings.Builder
 		inWord     bool
 		nameQuoted bool
 		sawEq      bool
-		// groupDepth counts open ( and {. kwDepth counts open compound
-		// commands; caseDepth counts open case commands, whose pattern
-		// ")" closes no group. Any nonzero depth, including one an
-		// unbalanced script drives negative, marks commands scoped.
-		groupDepth, kwDepth, caseDepth int
-		// prevOp is the operator that joined the previous command.
-		prevOp string
 	)
+	simple = true
 	endWord := func() {
 		if inWord {
 			words = append(words, shellWord{text: cur.String(), nameQuoted: nameQuoted})
@@ -244,40 +246,15 @@ func shellCommands(script string) []shellCommand {
 		cur.Reset()
 		inWord, nameQuoted, sawEq = false, false, false
 	}
-	// endCmd ends the current command at op: a control operator, ";" for
-	// a plain command end, or "" at a group bracket.
-	endCmd := func(op string) {
+	endCmd := func() {
 		endWord()
-		if len(words) == 0 {
-			// A blank line or the gap at a bracket keeps the operator that
-			// joins the next command to the previous one.
-			if op != ";" && op != "" {
-				prevOp = op
+		if len(words) > 0 {
+			if !words[0].nameQuoted && shellReserved[words[0].text] {
+				simple = false
 			}
-			return
+			cmds = append(cmds, words)
 		}
-		first := words[0].text
-		if words[0].nameQuoted {
-			first = ""
-		}
-		switch first {
-		case "case":
-			caseDepth++
-			kwDepth++
-		case "if", "while", "until", "for", "select":
-			kwDepth++
-		}
-		scoped := groupDepth != 0 || kwDepth != 0 || joinsPrev[prevOp] || joinsNext[op]
-		switch first {
-		case "esac":
-			caseDepth--
-			kwDepth--
-		case "fi", "done":
-			kwDepth--
-		}
-		cmds = append(cmds, shellCommand{words: words, scoped: scoped})
 		words = nil
-		prevOp = op
 	}
 	quote := func() {
 		inWord = true
@@ -328,28 +305,23 @@ func shellCommands(script string) []shellCommand {
 		case c == ' ' || c == '\t':
 			endWord()
 		case c == '\n' || c == ';':
-			endCmd(";")
-		case c == '&' || c == '|':
-			op := string(c)
-			if i+1 < len(script) && (script[i+1] == c || (c == '|' && script[i+1] == '&')) {
-				op += string(script[i+1])
-				i++
-			}
-			endCmd(op)
-		case c == '(' || (c == '{' && !inWord):
-			endCmd("")
-			groupDepth++
-		case c == ')' || (c == '}' && !inWord):
-			endCmd("")
-			if c == '}' || caseDepth == 0 {
-				groupDepth--
-			}
+			endCmd()
+		case c == '&' || c == '|' || c == '(' || c == ')':
+			simple = false
+			endCmd()
+		case (c == '{' || c == '}') && !inWord:
+			simple = false
+			endCmd()
 		case c == '#' && !inWord:
 			for i < len(script) && script[i] != '\n' {
 				i++
 			}
-			endCmd(";")
+			endCmd()
 		default:
+			// A here-document body would be read as live commands.
+			if strings.HasPrefix(script[i:], "<<") {
+				simple = false
+			}
 			inWord = true
 			if c == '=' {
 				sawEq = true
@@ -357,8 +329,8 @@ func shellCommands(script string) []shellCommand {
 			cur.WriteByte(c)
 		}
 	}
-	endCmd(";")
-	return cmds
+	endCmd()
+	return cmds, simple
 }
 
 // skipSubstitution returns the index just past the ")" closing the command
