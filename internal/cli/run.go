@@ -2920,8 +2920,8 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 				printer.StepWarn("Scan stderr: " + stderr)
 			}
 			if h.FailModeClosed() {
-				printer.StepFail("BLOCKED: pre-agent scan detected critical findings")
-				return fmt.Errorf("pre-agent security scan blocked: critical findings detected")
+				printer.StepFail("BLOCKED: pre-agent scan failed (critical findings or unreadable context files)")
+				return fmt.Errorf("pre-agent security scan blocked: critical findings detected or context files unreadable")
 			}
 			printer.StepWarn("Continuing despite findings (fail_mode: open)")
 		} else {

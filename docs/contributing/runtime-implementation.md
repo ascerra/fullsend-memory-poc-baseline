@@ -212,7 +212,7 @@ How the shared PostToolUse chain reaches each runtime — the three sanitizer ro
 
 ### Fail modes
 
-Harness `security.fail_mode` controls whether critical findings **block** the run (`closed`, default) or **warn** and continue (`open`). This applies to host scans, sandbox `scan context`, and the host-side runtime content scan alike.
+Harness `security.fail_mode` controls whether critical findings **block** the run (`closed`, default) or **warn** and continue (`open`). This applies to host scans, sandbox `scan context`, and the host-side runtime content scan alike. Sandbox `scan context` also exits non-zero when a context file it was given cannot be read, so an unreadable context file is handled the same way as a critical finding.
 
 ## Runtime interface contract
 
@@ -670,7 +670,8 @@ defense-in-depth passes before the agent starts:
 2. **Sandbox-side (Path B, step 9b):** `buildScanContextCommand()` runs
    `fullsend scan context` inside the sandbox after all files are assembled.
 
-Critical findings block the run in `fail_mode: closed`.
+Critical findings, or a requested context file that cannot be read, block
+the run in `fail_mode: closed`.
 
 ## Dummy runtime operations
 
